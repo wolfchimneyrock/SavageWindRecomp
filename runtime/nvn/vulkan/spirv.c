@@ -154,10 +154,27 @@ static uint32_t *no_contraction(uint32_t *spv, size_t *nwords) {
 // No spirv-opt by default: it rewrote the depth pre-pass and colour-pass vertex shaders differently enough that
 // their depths stopped matching (EQUAL test: black holes in foliage), and it was most of the compile time; the
 // driver optimises anyway. SAVAGEWIND_VK_OPT=1 turns it back on (experiments).
+// Mali (Arm's driver): fragment and compute shaders are run through spirv-opt (performance). The translated pc-loop
+// shaders (a switch on a guest pc inside a loop, every guest register a function-scope variable, the SSY / PBK
+// stacks as dynamically indexed arrays) compiled at -O0 are pathological for Mali's compiler: in LASRecomp (the same
+// translator) the interiors' light-list pass took 400-800 ms of GPU a frame on a Mali-G610, 9 ms optimised
+// (peiikai/LASRecomp #527). Vertex shaders stay -O0 (the depth pre-pass / EQUAL reason above).
+// SAVAGEWIND_VK_OPT_FS=0/1 forces it off / on for any GPU; the optimised SPIR-V has its own cache entries.
+static bool opt_stage(int stage) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SAVAGEWIND_VK_OPT_FS");
+        on = e ? atoi(e) != 0 : g_vk.is_mali;
+        if (on) LOG("[vk] fragment / compute shaders optimised (spirv-opt)%s\n", e ? " (SAVAGEWIND_VK_OPT_FS)" : ": Mali");
+    }
+    return getenv("SAVAGEWIND_VK_OPT") || (on && stage != STAGE_VERTEX);
+}
+static uint64_t spirv_key(const char *src, int stage) { return src_hash(src, stage) ^ (opt_stage(stage) ? 0x9e3779b97f4a7c15ull : 0); }
+
 // The SPIR-V of src in the disk cache (compiled now if missing): 0 it was there, 1 compiled, -1 failed.
 int vk_spirv_ensure(const char *src, int stage) {
     char path[512];
-    spirv_path(path, sizeof path, src_hash(src, stage));
+    spirv_path(path, sizeof path, spirv_key(src, stage));
     struct stat st;
     if (!getenv("SAVAGEWIND_VK_NO_SPIRV_CACHE") && !stat(path, &st) && st.st_size > 20) return 0;
     size_t n = 0;
@@ -181,7 +198,8 @@ static void strip_names(uint32_t *spv, size_t *nwords) {
 }
 
 uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t *nwords) {
-    uint64_t h = src_hash(src, stage);
+    bool opt = opt_stage(stage);
+    uint64_t h = spirv_key(src, stage);
     static int nocache = -1;
     if (nocache < 0) nocache = getenv("SAVAGEWIND_VK_NO_SPIRV_CACHE") != NULL;
     uint32_t *out = nocache ? NULL : cache_load(h, nwords);
@@ -190,8 +208,7 @@ uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t 
     if (!comp) comp = shaderc_compiler_initialize();
     shaderc_compile_options_t o = shaderc_compile_options_initialize();
     shaderc_compile_options_set_target_env(o, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
-    shaderc_compile_options_set_optimization_level(o, getenv("SAVAGEWIND_VK_OPT") ? shaderc_optimization_level_performance
-                                                                                  : shaderc_optimization_level_zero);
+    shaderc_compile_options_set_optimization_level(o, opt ? shaderc_optimization_level_performance : shaderc_optimization_level_zero);
     shaderc_compilation_result_t r = shaderc_compile_into_spv(comp, src, strlen(src), kind_of(stage), name, "main", o);
     shaderc_compile_options_release(o);
     if (shaderc_result_get_compilation_status(r) != shaderc_compilation_status_success) {
