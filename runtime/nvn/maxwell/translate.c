@@ -1832,7 +1832,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                     sp(&c->body, "      if (ok) { uint wi = uint(ga >> 2); uint sh = uint(ga & %s) * 8u; uint gm = ~(0x%xu << sh), gv = (%s & 0x%xu) << sh; "
                        "%s }\n", size < 2 ? "3ul" : "2ul", size < 2 ? 0xFFu : 0xFFFFu, R(d),
                        size < 2 ? 0xFFu : 0xFFFFu,
-                       maxwell_gmem_split ? "if (wi < GSPLIT) { atomicAnd(gmem_.w[wi], gm); atomicOr(gmem_.w[wi], gv); } "
+                       maxwell_gmem_mirror ? "wi = gfind(wi); if (wi != 0xFFFFFFFFu) { atomicAnd(gmem_.w[wi], gm); atomicOr(gmem_.w[wi], gv); }"
+                       : maxwell_gmem_split ? "if (wi < GSPLIT) { atomicAnd(gmem_.w[wi], gm); atomicOr(gmem_.w[wi], gv); } "
                                             "else { atomicAnd(gmem2_.w[wi - GSPLIT], gm); atomicOr(gmem2_.w[wi - GSPLIT], gv); }"
                                           : "atomicAnd(gmem_.w[wi], gm); atomicOr(gmem_.w[wi], gv);");
                 else
@@ -2509,7 +2510,20 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (info->npush)  // (push_promote)
         sp(&s, "layout(push_constant, std430) uniform PCw { layout(offset = %u) uint pcw[%d]; };\n", info->push_base, info->npush);
     info->writes_gmem = info->uses_gmem && c->uses_gmem_store;
-    if (info->uses_gmem) {
+    if (info->uses_gmem && maxwell_gmem_mirror) {
+        // (maxwell_gmem_mirror: no heap behind it) copies of the ranges the draw or dispatch has bound, in one buffer, and
+        // a table of them: x = first heap word, y = words, z = word in gmem_.w (gmap[GMAP_N].x: how many). Outside them
+        // reads are 0 and stores are dropped.
+        sp(&s, "layout(std430, set = %d, binding = %d) %sbuffer GMem { uint w[]; } gmem_;\n", set, GMEM_BUFFER_INDEX,
+           c->uses_gmem_store ? "" : "readonly ");
+        sp(&s, "layout(std140, set = %d, binding = %d) uniform GMap { uvec4 gmap[%d]; };\n", set, GMAP_BUFFER_INDEX, GMAP_N + 1);
+        sp(&s, "uint gfind(uint i) {\n"
+               "  uint n_ = min(gmap[%d].x, %du);\n"
+               "  for (uint k_ = 0u; k_ < n_; k_++) { uint o_ = i - gmap[k_].x; if (o_ < gmap[k_].y) return gmap[k_].z + o_; }\n"
+               "  return 0xFFFFFFFFu;\n}\n", GMAP_N, GMAP_N);
+        sp(&s, "uint GLD(uint i) { uint f_ = gfind(i); return f_ != 0xFFFFFFFFu ? gmem_.w[f_] : 0u; }\n");
+        sp(&s, "#define GST(i, v) { uint f_ = gfind(i); if (f_ != 0xFFFFFFFFu) gmem_.w[f_] = (v); }\n");
+    } else if (info->uses_gmem) {
         // The heap in one storage buffer, or (maxwell_gmem_split: the device's maxStorageBufferRange is below the heap,
         // Mali-G610's 2 GB against 3 GB) in two, split at GMEM_SPLIT. GLD / GST read and write a word of it.
         bool split = maxwell_gmem_split && !maxwell_gmem_bda;
@@ -2743,11 +2757,12 @@ const char *maxwell_translator_id(void) {
 // the variant it was made under; one of a global memory shader made under another is translated again
 // (shaders.c xlate_load), the rest are kept: a change of these switches (a device, a driver, a new default in exec.c)
 // no longer throws every cache away, as it did when they were part of the translator's id.
-bool maxwell_gmem_split, maxwell_gmem_snap, maxwell_gmem_bda;
+bool maxwell_gmem_split, maxwell_gmem_snap, maxwell_gmem_bda, maxwell_gmem_mirror;
 const char *maxwell_translation_variant(void) {
     static __thread char v[64];  // (per thread: the precompile's workers ask for it at once)
-    snprintf(v, sizeof v, "%s%s%s %llx+%llx", maxwell_gmem_split ? "s" : "-", maxwell_gmem_snap ? "n" : "-",
+    snprintf(v, sizeof v, "%s%s%s%s %llx+%llx", maxwell_gmem_split ? "s" : "-", maxwell_gmem_snap ? "n" : "-",
              maxwell_gmem_bda ? "a" : "",  // (by address: Turnip; nothing added otherwise, so other caches stay valid)
+             maxwell_gmem_mirror ? "m" : "",  // (through copies: PanVK; the same)
              (unsigned long long)maxwell_gmem_base, (unsigned long long)maxwell_gmem_size);
     return v;
 }

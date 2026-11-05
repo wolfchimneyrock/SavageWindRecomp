@@ -111,6 +111,14 @@ extern uint64_t maxwell_gmem_base, maxwell_gmem_size;
 // then a uniform buffer { uint64_t address, size } and every access is checked against that size. All change
 // translations.
 extern bool maxwell_gmem_split, maxwell_gmem_snap, maxwell_gmem_bda;
+// (GLSL / Vulkan) No heap the GPU can reach (no VK_EXT_external_memory_host and the heap not GPU memory either, exec.c
+// heap_mode: Mesa's PanVK): global memory goes through
+// copies of the ranges the draw or dispatch binds (vulkan/exec.c gmir_), found in a table at GMAP_BUFFER_INDEX
+// (`uniform GMap { uvec4 gmap[GMAP_N + 1]; }`: x = first heap word, y = words, z = word in GMem; gmap[GMAP_N].x = how
+// many). Outside them reads are 0 and stores are dropped. Changes translations (not with split / snap / bda).
+extern bool maxwell_gmem_mirror;
+#define GMAP_BUFFER_INDEX 22
+#define GMAP_N 32
 // (GLSL) Set by the Vulkan backend before translating: the default of the switches below for this GPU, and the push
 // constant budget (words, at most 64: the device's maxPushConstantsSize).
 extern bool maxwell_glsl_push;
