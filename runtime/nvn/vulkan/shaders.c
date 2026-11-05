@@ -455,6 +455,9 @@ static uint64_t xlate_id(const uint8_t *code, size_t max_size, int stage, const 
     uint64_t h = hash64(0xcbf29ce484222325ull, id, strlen(id));
     h = hash64(h, hd, sizeof *hd);
     h = hash64(h, code, hd->bin_size);
+    // (SAVAGEWIND_VK_INLINE_C1: c1's values are in the translation, maxwell_const_data)
+    if (key->glsl && maxwell_const_data && maxwell_const_size && maxwell_inline_c1())
+        h = hash64(h, maxwell_const_data, maxwell_const_size);
     return h ? h : 1;
 }
 

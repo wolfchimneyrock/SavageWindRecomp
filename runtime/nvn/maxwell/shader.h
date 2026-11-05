@@ -89,6 +89,12 @@ typedef struct {
                             // target scale, [1 + i] = allocation scale of texture i
     uint32_t local_mem;     // bytes of local memory
     uint32_t num_insts;
+    // (GLSL vertex / fragment, SAVAGEWIND_VK_PUSH_CB=1) constant buffer words moved into push constants: pcw[k] is the
+    // word at byte push_off[k] of cbuf push_cb[k] (3+, the game's), the most read first (loops weigh more), at byte
+    // push_base of the push range (maxwell_push_range). Kept in fast uniform registers where a driver doesn't promote
+    // uniform buffer words itself (Mesa's PanVK); the backend pushes them with each draw.
+    uint8_t npush, push_cb[64];
+    uint16_t push_off[64], push_base;
     char error[256];        // set when translation fails
 } ShaderInfo;
 
@@ -105,6 +111,26 @@ extern uint64_t maxwell_gmem_base, maxwell_gmem_size;
 // then a uniform buffer { uint64_t address, size } and every access is checked against that size. All change
 // translations.
 extern bool maxwell_gmem_split, maxwell_gmem_snap, maxwell_gmem_bda;
+// (GLSL) Set by the Vulkan backend before translating: the default of the switches below for this GPU, and the push
+// constant budget (words, at most 64: the device's maxPushConstantsSize).
+extern bool maxwell_glsl_push;
+extern uint32_t maxwell_push_cap;
+// SAVAGEWIND_VK_INLINE_C1 (default maxwell_glsl_push): the statically indexed reads of c1 (the stage's compiler
+// constants, the bytes after its code) as literals instead of uniform buffer loads. The caller sets the stage's c1
+// around maxwell_translate (per thread; NULL: none, no literals): a translation then also depends on those bytes
+// (shaders.c names its cache entry with them).
+extern __thread const uint8_t *maxwell_const_data;
+extern __thread uint32_t maxwell_const_size;
+bool maxwell_inline_c1(void);
+// SAVAGEWIND_VK_PUSH_CB (default maxwell_glsl_push; SAVAGEWIND_VK_PUSH_VS=0: none in vertex shaders): the most read
+// constant buffer words of vertex and fragment shaders as push constants (ShaderInfo npush). Where each stage's go:
+// bytes [base, base + size) of the push range, the same for every shader of a stage (a graphics pipeline library's
+// layout is made before the stage it pairs with is known): the vertex shader's first, unless it is a motion vector
+// variant (mvec: the first MAXWELL_MVEC_PUSH bytes are its history offsets, vulkan/mvec.c, and it gets none), the
+// fragment shader's after them. size 0: none.
+bool maxwell_push_cb(void);
+#define MAXWELL_MVEC_PUSH 112
+void maxwell_push_range(int stage, bool mvec, uint32_t *base, uint32_t *size);
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register
 // maxwell_dbg_reg as captured after the instruction at maxwell_dbg_pc (greyscale, all targets).
 extern const uint8_t *maxwell_dbg_code;

@@ -59,7 +59,14 @@ static const struct { const char *archive; int attr, kind; } kinds[] = {
     {"/uking_grass.product.sbfsha", 2, 4},  // uint read as float
 };
 
-typedef struct { int shader; ShaderKey key; bool mvec; } Job;  // (mvec: a motion vector variant made here)
+typedef struct { int shader; ShaderKey key; bool mvec; } Job;
+
+// (SAVAGEWIND_VK_INLINE_C1) a shader's compiler constants for the translator, as exec.c prog_c1 gives the game's
+static void sa_c1(const SaShader *s) {
+    bool has = s && s->const_size && s->stage != STAGE_COMPUTE;  // (compute: none, as exec.c translates them)
+    maxwell_const_data = has ? s->code + s->max_size : NULL;
+    maxwell_const_size = has ? s->const_size : 0;
+}  // (mvec: a motion vector variant made here)
 typedef struct { int vs, fs, cs; } Pair;  // (jobs: the predicted key's; vs or fs alone: that shader's libraries)
 
 typedef struct {
@@ -87,7 +94,9 @@ static void *worker(void *arg) {
         const Job *j = &w->jobs[i];
         const SaShader *s = &w->set->shaders[j->shader];
         char why[300] = "";
+        sa_c1(s);
         int r = vk_precompile_one(s->code, s->max_size, s->stage, &j->key, why, sizeof why);
+        sa_c1(NULL);
         // (a motion variant the translator refuses - varyings 30 / 31 or the motion target's slot in use - is one the
         // game cannot draw either: not a failure)
         if (r < 0 && j->mvec) atomic_fetch_add(&w->mvec_failed, 1);
@@ -157,14 +166,19 @@ static void *pipe_worker(void *arg) {
         } else if (pr->vs < 0 || pr->fs < 0) {  // (graphics pipeline libraries: a shader alone)
             const Job *j = &w->jobs[pr->vs >= 0 ? pr->vs : pr->fs];
             const SaShader *sh = &w->set->shaders[j->shader];
+            sa_c1(sh);
             ShaderInfo *si = vk_xlate_read(sh->code, sh->max_size, sh->stage, &j->key);
+            sa_c1(NULL);
             if (si) ok = vk_pso_warm_stage(si, sh->stage);
             maxwell_free(si);
         } else {
             const Job *v = &w->jobs[pr->vs], *f = &w->jobs[pr->fs];
             const SaShader *vs = &w->set->shaders[v->shader], *fs = &w->set->shaders[f->shader];
+            sa_c1(vs);
             ShaderInfo *vi = vk_xlate_read(vs->code, vs->max_size, vs->stage, &v->key);
+            sa_c1(fs);
             ShaderInfo *fi = vi ? vk_xlate_read(fs->code, fs->max_size, fs->stage, &f->key) : NULL;
+            sa_c1(NULL);
             if (vi && fi) ok = vk_pso_warm(vi, fi, v->key.attr_kind);
             maxwell_free(vi);
             maxwell_free(fi);

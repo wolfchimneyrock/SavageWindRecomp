@@ -761,6 +761,14 @@ void vk_translator_setup(void) {
     // memory shaders' translations were taken for another variant and their pipelines skipped)
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
+    // c1 inlined and the hot constant buffer words as push constants (translate.c): off by default (in LAS Recomp they
+    // help Mesa's PanVK, which reads constant buffers from memory every time; not yet measured here).
+    // SAVAGEWIND_VK_INLINE_C1 / SAVAGEWIND_VK_PUSH_CB =1 turn them on.
+    maxwell_glsl_push = false;
+    uint32_t pcw = g_vk.props.limits.maxPushConstantsSize / 4;
+    maxwell_push_cap = pcw < 64 ? pcw : 64;
+    LOG("[vk] shader constants: c1 %s, push constants %s (%u words)\n", maxwell_inline_c1() ? "inlined" : "read",
+        maxwell_push_cb() ? "on" : "off", maxwell_push_cap);
     LOG("[vk] shader global memory: %s (storage buffer limit %u MB), the HUD's reads %s\n",
         maxwell_gmem_bda ? "by address" : maxwell_gmem_split ? "two bindings" : "one binding", lim >> 20,
         maxwell_gmem_snap ? "through copies" : "in place");
@@ -955,6 +963,14 @@ VkSpan vk_transient(uint64_t size, uint64_t align) {
     stat_upload_bytes += size;
     perfcount_add(PC_UPLOAD_BYTES, size);
     return (VkSpan){chunks[pick].buf, 0, chunks[pick].ptr};
+}
+
+// The CPU address of transient memory (a VkSpan's buffer and offset), NULL if it isn't (SAVAGEWIND_VK_PUSH_CB: a
+// patched constant buffer's copy, read back for the words a draw pushes; the ring may be write-combined: rare reads only)
+static const uint8_t *transient_ptr(VkBuffer buf, uint64_t off) {
+    for (int i = 0; i < nchunks; i++)
+        if (chunks[i].buf == buf) return off < chunks[i].size ? chunks[i].ptr + off : NULL;
+    return NULL;
 }
 
 // GPU -> CPU copies: the ring is write-combined (often device-local over the BAR), where CPU reads crawl (a
@@ -2576,6 +2592,7 @@ typedef struct {
     ShaderInfo *vi, *fi;
     uint64_t code[2], cmax[2];  // translation inputs (copied: translated on the translator thread)
     int8_t ui;                  // vertex shader of the game's layouts (freecam_hud_drop): 0 unknown, 1 yes, -1 no
+    uint32_t csize[2];          // (their compiler constants' size, at code + cmax: prog_c1)
     ShaderKey vkey, fkey;
     VkShaderModule vs, fs;
     VkBindingInfo binds[MAX_BIND];
@@ -2591,14 +2608,32 @@ typedef struct {
 // The push constants of a motion vector program (mvec.c MVEC_PUSH: the history offsets of the previous frame's
 // constant buffers), in the layouts of its stages, their libraries and the program
 static const VkPushConstantRange mvec_push_range = {VK_SHADER_STAGE_VERTEX_BIT, 0, MVEC_PUSH};
+_Static_assert(MVEC_PUSH == MAXWELL_MVEC_PUSH, "the translator's push layout (maxwell_push_range) starts after MvPush");
+
+// The push constant ranges of a graphics layout (its stages' libraries' too: the same for every program of a kind): a
+// motion vector program's history offsets (vertex), and with SAVAGEWIND_VK_PUSH_CB the promoted constant buffer words of
+// each stage (translate.c maxwell_push_range, ShaderInfo npush: draw_ pushes them)
+static uint32_t push_ranges(bool mvec, VkPushConstantRange r[2]) {
+    uint32_t n = 0, base, size;
+    if (mvec) r[n++] = mvec_push_range;
+    else {
+        maxwell_push_range(STAGE_VERTEX, false, &base, &size);
+        if (size) r[n++] = (VkPushConstantRange){VK_SHADER_STAGE_VERTEX_BIT, base, size};
+    }
+    maxwell_push_range(STAGE_FRAGMENT, mvec, &base, &size);
+    if (size) r[n++] = (VkPushConstantRange){VK_SHADER_STAGE_FRAGMENT_BIT, base, size};
+    return n;
+}
 
 static VkPipelineLayout make_layout(const VkBindingInfo *binds, int nbinds, VkDescriptorSetLayout *set_layout, int nsets,
                                     VkShaderStageFlags s0, VkShaderStageFlags s1, bool mvec) {
     set_layout[0] = vk_set_layout(binds, nbinds, 0, s0);
     if (nsets > 1) set_layout[1] = vk_set_layout(binds, nbinds, 1, s1);
+    VkPushConstantRange pr[2];
+    uint32_t npr = s0 == VK_SHADER_STAGE_VERTEX_BIT ? push_ranges(mvec, pr) : 0;  // (graphics)
     VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = (uint32_t)nsets,
-                                     .pSetLayouts = set_layout, .pushConstantRangeCount = mvec ? 1u : 0u,
-                                     .pPushConstantRanges = &mvec_push_range};
+                                     .pSetLayouts = set_layout, .pushConstantRangeCount = npr,
+                                     .pPushConstantRanges = npr ? pr : NULL};
     VkPipelineLayout l;
     VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &l));
     return l;
@@ -2821,11 +2856,12 @@ static const ProgBuild *prog_build(const ShaderInfo *vi, const ShaderInfo *fi, b
     if (g_vk.gpl && v->set_layout && f->set_layout) {  // (the libraries' sets: "identically defined" by being the same;
         b->set_layout[0] = v->set_layout;               //  their dynamic uniform buffers were picked per stage, stage_layouts)
         b->set_layout[1] = f->set_layout;
-        bool mv = vi->mvec || fi->mvec;
+        VkPushConstantRange pr[2];
+        uint32_t npr = push_ranges(vi->mvec || fi->mvec, pr);
         VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
                                          .flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT, .setLayoutCount = 2,
-                                         .pSetLayouts = b->set_layout, .pushConstantRangeCount = mv ? 1u : 0u,
-                                         .pPushConstantRanges = &mvec_push_range};
+                                         .pSetLayouts = b->set_layout, .pushConstantRangeCount = npr,
+                                         .pPushConstantRanges = npr ? pr : NULL};
         VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &b->layout));
     } else {
         ubo_dynamic_mark(b->binds, b->nbinds);
@@ -2913,6 +2949,13 @@ static bool fs_sel_match(const FsSel *f, uint64_t code, uint64_t hash) {
     return code && f->pc % 32 && f->pc < 0x10000 && ((const uint64_t *)(uintptr_t)(code + 0x80))[f->pc / 8] == f->v;
 }
 
+// (SAVAGEWIND_VK_INLINE_C1) a program stage's compiler constants for the translator (maxwell_const_data: this thread)
+static void prog_c1(const Prog *p, int i) {
+    bool has = p->code[i] && p->cmax[i] != 0x10000 && p->csize[i];
+    maxwell_const_data = has ? (const uint8_t *)(uintptr_t)(p->code[i] + p->cmax[i]) : NULL;
+    maxwell_const_size = has ? p->csize[i] : 0;
+}
+
 static void translate_program(void *arg) {
     Prog *p = arg;
     uint64_t pt0 = SDL_GetTicksNS();
@@ -2940,12 +2983,15 @@ static void translate_program(void *arg) {
     }
     const uint8_t *vcode = (const uint8_t *)(uintptr_t)p->code[0], *fcode = (const uint8_t *)(uintptr_t)p->code[1];
     vk_key_normalize(vcode, STAGE_VERTEX, &p->vkey);
+    prog_c1(p, 0);
     p->vi = vk_translate_cached(vcode, p->cmax[0], STAGE_VERTEX, &p->vkey);
     if (p->vi->msl) {
         p->fkey.vs_out_mask = p->vi->out_mask;
         vk_key_normalize(fcode, STAGE_FRAGMENT, &p->fkey);
+        prog_c1(p, 1);
         p->fi = vk_translate_cached(fcode, p->cmax[1], STAGE_FRAGMENT, &p->fkey);
     }
+    maxwell_const_data = NULL, maxwell_const_size = 0;
     pthread_mutex_unlock(&translate_lock);
     {   // the normalized keys rest on the SPH naming every input the code reads (vk_key_normalize)
         static int told;
@@ -2982,11 +3028,15 @@ static bool program_ready_now(Prog *p) {
     static int dbg = -1;  // (SAVAGEWIND_DBG_FS changes translations: always through the translator thread)
     if (dbg < 0) dbg = getenv("SAVAGEWIND_DBG_FS") != NULL;
     if (dbg) return false;
+    prog_c1(p, 0);
     ShaderInfo *vi = vk_translate_peek((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
+    maxwell_const_data = NULL, maxwell_const_size = 0;
     if (!vi || !vi->msl) return false;
     ShaderKey fk = p->fkey;
     fk.vs_out_mask = vi->out_mask;
+    prog_c1(p, 1);
     ShaderInfo *fi = vk_translate_peek((const uint8_t *)(uintptr_t)p->code[1], p->cmax[1], STAGE_FRAGMENT, &fk);
+    maxwell_const_data = NULL, maxwell_const_size = 0;
     if (!fi || !fi->msl || !prog_build_peek(vi, fi)) return false;
     p->fkey = fk;
     p->vi = vi;
@@ -3040,6 +3090,7 @@ static Prog *get_program_(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     for (int i = 0; i < 2; i++) {
         p->code[i] = np->stages[i].code_addr;
         p->cmax[i] = np->stages[i].const_offset ? np->stages[i].const_offset : 0x10000;
+        p->csize[i] = np->stages[i].const_size;
     }
     p->vkey = *vkey;
     p->fkey = *fkey;
@@ -3501,10 +3552,12 @@ static void stage_layouts(StageBuild *b, int stage) {
     ubo_dynamic_mark_stage(b->binds, b->nbinds, set);
     b->set_layout = vk_set_layout(b->binds, b->nbinds, set, stage == STAGE_VERTEX ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT);
     VkDescriptorSetLayout sl[2] = {stage == STAGE_VERTEX ? b->set_layout : VK_NULL_HANDLE, b->set_layout};
+    VkPushConstantRange pr[2];
+    uint32_t npr = push_ranges(b->si->mvec, pr);
     VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
                                      .flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT, .setLayoutCount = set + 1,
-                                     .pSetLayouts = sl, .pushConstantRangeCount = b->si->mvec ? 1u : 0u,
-                                     .pPushConstantRanges = &mvec_push_range};
+                                     .pSetLayouts = sl, .pushConstantRangeCount = npr,
+                                     .pPushConstantRanges = npr ? pr : NULL};
     VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &b->lib_layout));
 }
 
@@ -4721,6 +4774,37 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     // within a command list nothing writes guest memory (no inline UpdateUniformBuffer: that writes through below
     // and drops the shared copies).
     return ubo_span(guest_copy(r.addr, size), size);
+}
+
+// (SAVAGEWIND_VK_PUSH_CB, draw_) Where the CPU reads the bytes cbuf_info binds for the game's constant buffer k (3+) of a
+// stage, for the words the shader takes as push constants (ShaderInfo npush): its guest memory, or the copy a patch
+// made of it (sdw_patch, up_patch, up_patch_frag, hud_patch: the same calls, memoized there; fxaa_patch: a second
+// copy, one draw a frame). *size: its bytes; NULL: none bound (zeros). A range a shader of this command list writes (gw_ubo_direct, read in place by the GPU) isn't
+// written yet when the draw is recorded: its guest memory as it is now (logged once).
+static const uint8_t *cbuf_cpu(int stage, const ShaderInfo *si, int k, uint64_t *size_out) {
+    int idx = k - 3;
+    Range r = (idx >= 0 && idx < 18) ? st.ubuf[stage][idx] : (Range){0, 0};
+    *size_out = 0;
+    if (!r.addr) return NULL;
+    uint64_t size = si->cbuf_size[k] ? si->cbuf_size[k] : 256;
+    if ((si->cbuf_dynamic & (1u << k)) && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;
+    if (size > r.size && r.size) size = r.size;
+    if (size < 16) size = 16;
+    *size_out = size;
+    VkDescriptorBufferInfo d;
+    if (stage == 1 && k == 3 && fxaa_off && fxaa_patch(r.addr, size, &d)) {
+        const uint8_t *p = transient_ptr(d.buffer, d.offset);
+        if (p) { *size_out = d.range; return p; }
+    } else if (gw_ubo_direct(r.addr, size, &d)) {
+        static int told;
+        if (!told++) LOG("[vk] push constants from a constant buffer the GPU writes in this command list (%llx): as the CPU has it\n",
+                         (unsigned long long)r.addr);
+    } else if ((stage == 1 && sdw_fix.s > 1 && sdw_patch(r.addr, size, &d)) || (stage == 0 && up_fix.sx > 0 && up_patch(r.addr, size, &d)) ||
+               (stage == 1 && up_fix.sx > 0 && up_patch_frag(r.addr, size, &d)) || (stage == 0 && k == 3 && hud_patch(r.addr, size, &d))) {
+        const uint8_t *p = transient_ptr(d.buffer, d.offset);
+        if (p) { *size_out = d.range; return p; }
+    }
+    return (const uint8_t *)(uintptr_t)r.addr;
 }
 
 // Global memory (shader LDG/STG, maxwell_gmem_base = HEAP_BASE): on Windows, sparse-bind committed guest pages
@@ -8192,6 +8276,18 @@ have_pipe:
         if (i >= 0) LOG("[fxaa] the game's FXAA off (fs hash %016llx)\n", (unsigned long long)(logged[i] = g_cur_fs_hash));
     }
     VkDescriptorSet fset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii, dyn, &ndyn);
+    uint32_t pushw[2][64];  // (SAVAGEWIND_VK_PUSH_CB) the words the stages take as push constants, as the sets bind them
+    for (int sg = 0; sg < 2; sg++) {
+        const ShaderInfo *si = sg ? pr->fi : pr->vi;
+        int last = -1;
+        const uint8_t *src = NULL;
+        uint64_t sz = 0;
+        for (int i = 0; i < si->npush; i++) {
+            if (si->push_cb[i] != last) last = si->push_cb[i], src = cbuf_cpu(sg, si, last, &sz);
+            uint32_t o = si->push_off[i];
+            pushw[sg][i] = src && o + 4 <= sz ? *(const uint32_t *)(src + o) : 0;
+        }
+    }
     sdw_fix.s = 0, up_fix.sx = 0, fxaa_off = false;
     if (profd) prof_sets += SDL_GetTicksNS() - prof_t1_;
     PZ_SPAN("exec/draw/sets", pz6, PZ_NOW());
@@ -8205,6 +8301,8 @@ have_pipe:
         memcpy(dc.dyn, dyn, (size_t)ndyn * 4);
     }
     if (mvec_draw) rec_CmdPushConstants(cb, pr->layout, VK_SHADER_STAGE_VERTEX_BIT, 0, MVEC_PUSH, mvec_pc);
+    if (pr->vi->npush) rec_CmdPushConstants(cb, pr->layout, VK_SHADER_STAGE_VERTEX_BIT, pr->vi->push_base, pr->vi->npush * 4u, pushw[0]);
+    if (pr->fi->npush) rec_CmdPushConstants(cb, pr->layout, VK_SHADER_STAGE_FRAGMENT_BIT, pr->fi->push_base, pr->fi->npush * 4u, pushw[1]);
 
     uint64_t prof_t2_ = profd ? SDL_GetTicksNS() : 0;
     ProfZone pz7 = PZ_NOW();

@@ -26,6 +26,10 @@
 #define RT_UINT(k) ((k) == 2 || (k) == 5 || (k) == 6)
 
 uint64_t maxwell_gmem_base, maxwell_gmem_size;
+bool maxwell_glsl_push;          // (shader.h)
+uint32_t maxwell_push_cap = 32;  // (words: Vulkan's minimum 128 bytes, until the backend says)
+__thread const uint8_t *maxwell_const_data;
+__thread uint32_t maxwell_const_size;
 const uint8_t *maxwell_dbg_code;
 uint32_t maxwell_dbg_pc;
 int maxwell_dbg_reg;
@@ -120,6 +124,37 @@ static void fail(Ctx *c, const char *fmt, ...) {
     va_end(ap);
 }
 
+// Switches read from the environment that change translations (=0 / =1): maxwell_translator_id names them
+static bool opt_env(const char *name, bool def) {
+    const char *e = getenv(name);
+    return e ? atoi(e) != 0 : def;
+}
+bool maxwell_inline_c1(void) {
+    static int v = -1;
+    if (v < 0) v = opt_env("SAVAGEWIND_VK_INLINE_C1", maxwell_glsl_push);
+    return v;
+}
+bool maxwell_push_cb(void) {
+    static int v = -1;
+    if (v < 0) v = opt_env("SAVAGEWIND_VK_PUSH_CB", maxwell_glsl_push);
+    return v;
+}
+static bool opt_push_vs(void) {
+    static int v = -1;
+    if (v < 0) v = opt_env("SAVAGEWIND_VK_PUSH_VS", true);
+    return v;
+}
+void maxwell_push_range(int stage, bool mvec, uint32_t *base, uint32_t *size) {
+    *base = *size = 0;
+    if (!maxwell_push_cb()) return;
+    uint32_t cap = maxwell_push_cap > 64 ? 64 : maxwell_push_cap;   // (words)
+    uint32_t vs = !opt_push_vs() ? 0 : cap < 32 ? cap / 2 : 16;     // (the vertex shader's share)
+    if (stage == STAGE_VERTEX) { if (!mvec) *size = vs * 4; return; }
+    if (stage != STAGE_FRAGMENT) return;
+    uint32_t b = mvec ? MAXWELL_MVEC_PUSH : vs * 4;
+    if (cap * 4 > b) *base = b, *size = cap * 4 - b;
+}
+
 // Branch targets may point at a scheduling word; execution continues at the next instruction.
 static uint32_t norm_target(int64_t t) {
     if (t >= 0 && ((t / 8) % 4) == 0) t += 8;
@@ -147,6 +182,15 @@ static const char *pred(Ctx *c, int p, bool neg, char *buf) {
 #define P(p, n) pred(c, (p), (n), alloca(16))
 
 static const char *cbuf_ref(Ctx *c, int idx, int64_t off, const char *dyn, char *buf) {
+    // c1 at a constant offset (GLSL, maxwell_inline_c1): the shader's own compiler constants never change, so the value
+    // itself instead of a uniform buffer load (on Mesa's PanVK a memory load every time, in the light loops too)
+    if (c->glsl && idx == 1 && !dyn && maxwell_const_data && off >= 0 && (off & 3) == 0 &&
+        off + 4 <= (int64_t)maxwell_const_size && maxwell_inline_c1()) {
+        uint32_t v;
+        memcpy(&v, maxwell_const_data + off, 4);
+        sprintf(buf, "0x%08xu", v);
+        return buf;
+    }
     c->info->cbuf_mask |= 1u << idx;
     if (off + 16 > (int64_t)c->info->cbuf_size[idx]) c->info->cbuf_size[idx] = (uint32_t)((off + 16 + 255) & ~255);
     if (!dyn && idx < 18 && off + 16 > (int64_t)c->cbuf_fixed[idx]) c->cbuf_fixed[idx] = (uint32_t)((off + 16 + 255) & ~255);
@@ -2228,6 +2272,78 @@ static void glsl_body(Ctx *c, Str *s, const char *body, bool any_branch, bool db
     }
 }
 
+// SAVAGEWIND_VK_PUSH_CB (vertex and fragment): the constant buffer words read most (at constant offsets, cbufs 3+: the
+// game's own) move into push constants: fast uniform registers instead of a uniform buffer load each (Mesa's PanVK
+// keeps no uniform buffer words in fast uniforms; Arm's driver promotes them itself). A read's weight is how often it
+// may run: x8 per enclosing loop, x1/2 per enclosing if / else. As many as the stage's share of the push range
+// (maxwell_push_range) holds. (Ported from LAS Recomp's translator, #563.)
+static void push_promote(Ctx *c, Str *body, bool mvec) {
+    if ((c->stage != STAGE_FRAGMENT && c->stage != STAGE_VERTEX) || !body->buf) return;
+    uint32_t base, size;
+    maxwell_push_range(c->stage, mvec, &base, &size);
+    int cap = (int)(size / 4);
+    if (cap > 64) cap = 64;
+    if (cap <= 0) return;
+    enum { MAXW = 512, MAXD = 64 };
+    typedef struct { uint8_t cb; uint16_t off; double w; } PushWord;
+    PushWord words[MAXW];
+    char scope[MAXD];  // 'l' loop, 'c' if / else, '-' other
+    int nw = 0, nd = 0, loops = 0, conds = 0;
+    const char *b = body->buf, *line = b;
+    for (const char *p = b; *p; p++) {
+        if (*p == '\n') line = p + 1;
+        if (*p == '{') {
+            char k = '-';
+            const char *q = p;  // (what opens it: "do {", "if (...) {", "else {")
+            while (q > line && q[-1] == ' ') q--;
+            if (q - line >= 2 && !strncmp(q - 2, "do", 2)) k = 'l';
+            else if (strstr(line, "if (") && strstr(line, "if (") < p) k = 'c';
+            else if (q - line >= 4 && !strncmp(q - 4, "else", 4)) k = 'c';
+            if (nd < MAXD) scope[nd] = k;
+            nd++;
+            if (k == 'l') loops++; else if (k == 'c') conds++;
+            continue;
+        }
+        if (*p == '}') {
+            if (nd > 0) { nd--; if (nd < MAXD) { if (scope[nd] == 'l') loops--; else if (scope[nd] == 'c') conds--; } }
+            continue;
+        }
+        int cb, row, col, len = 0;
+        if (p[0] == 'c' && p[1] == 'b' && (p == b || !id_char(p[-1])) &&
+            sscanf(p, "cb%d[%d][%d]%n", &cb, &row, &col, &len) == 3 && len && cb >= 3 && cb < 18 && col >= 0 && col < 4 &&
+            row >= 0 && row < 4096) {
+            uint16_t off = (uint16_t)(row * 16 + col * 4);
+            double w = 1;
+            for (int d = 0; d < loops && d < 6; d++) w *= 8;
+            for (int d = 0; d < conds && d < 6; d++) w *= 0.5;
+            int i = 0;
+            while (i < nw && !(words[i].cb == cb && words[i].off == off)) i++;
+            if (i == nw && nw < MAXW) words[nw++] = (PushWord){(uint8_t)cb, off, 0};
+            if (i < nw) words[i].w += w;
+            p += len - 1;
+        }
+    }
+    if (!nw) return;
+    for (int i = 1; i < nw; i++)  // (by weight, heaviest first)
+        for (int j = i; j > 0 && words[j].w > words[j - 1].w; j--) { PushWord t = words[j]; words[j] = words[j - 1]; words[j - 1] = t; }
+    int n = nw < cap ? nw : cap;
+    Str o = {0};
+    for (const char *p = b; *p;) {
+        int cb, row, col, len = 0, k = -1;
+        if (p[0] == 'c' && p[1] == 'b' && (p == b || !id_char(p[-1])) &&
+            sscanf(p, "cb%d[%d][%d]%n", &cb, &row, &col, &len) == 3 && len) {
+            for (int i = 0; i < n; i++) if (words[i].cb == cb && words[i].off == row * 16 + col * 4) { k = i; break; }
+        }
+        if (k >= 0) { sp(&o, "pcw[%d]", k); p += len; }
+        else { sp(&o, "%c", *p); p++; }
+    }
+    free(body->buf);
+    *body = o;
+    c->info->npush = (uint8_t)n;
+    c->info->push_base = (uint16_t)base;
+    for (int i = 0; i < n; i++) c->info->push_cb[i] = words[i].cb, c->info->push_off[i] = words[i].off;
+}
+
 // Declarations + entry point around the (rewritten) body; mirrors the MSL assembly in maxwell_translate.
 static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     ShaderInfo *info = c->info;
@@ -2248,6 +2364,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     }
     if (mvec_rt >= 0 && ((!mvec_mask && !mvec_still && (c->in_attr_mask >> 30)) || ((c->omap_target >> (mvec_rt * 4)) & 0xF)))
         fail(c, "mvec: input 30 / 31 or color %d in use", mvec_rt);
+    if (!mvec) push_promote(c, &body, mvec_rt >= 0 && !mvec_mask && !mvec_still);  // (the motion variants' push layout)
     if (info->uses_gmem && (info->cbuf_mask & (1u << GMEM_BUFFER_INDEX))) fail(c, "cbuf %d clashes with gmem", GMEM_BUFFER_INDEX);
     if (info->cbuf_mask >> 18) fail(c, "cbuf index out of range");
     for (int i = 0; i < info->ntex; i++)
@@ -2263,6 +2380,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         if (!n) n = 1;
         sp(&s, "layout(std140, set = %d, binding = %d) uniform CB%d { uvec4 cb%d[%u]; };\n", set, i, i, i, n);
     }
+    if (info->npush)  // (push_promote)
+        sp(&s, "layout(push_constant, std430) uniform PCw { layout(offset = %u) uint pcw[%d]; };\n", info->push_base, info->npush);
     info->writes_gmem = info->uses_gmem && c->uses_gmem_store;
     if (info->uses_gmem) {
         // The heap in one storage buffer, or (maxwell_gmem_split: the device's maxStorageBufferRange is below the heap,
@@ -2471,11 +2590,6 @@ size_t maxwell_binary_size(const uint8_t *blob, size_t max_size, int stage) {
 #ifndef TRANSLATOR_ID
 #define TRANSLATOR_ID __DATE__ " " __TIME__
 #endif
-// Switches read from the environment that change translations (SAVAGEWIND_XLATE_*, =0 / =1): named in the id too
-static bool opt_env(const char *name, bool def) {
-    const char *e = getenv(name);
-    return e ? atoi(e) != 0 : def;
-}
 static bool opt_static_stacks(void) {
     static int v = -1;
     if (v < 0) v = opt_env("SAVAGEWIND_XLATE_STATIC_STACKS", true);
@@ -2486,10 +2600,14 @@ static bool opt_goto_elim(void) {
     if (v < 0) v = opt_env("SAVAGEWIND_XLATE_GOTO_ELIM", true);
     return v;
 }
-// (the switches above change the translations of every branchy shader: they name caches of their own)
+// (the switches above, and c1 inlined / push constants, change the translations of many shaders: they name caches of
+// their own)
 const char *maxwell_translator_id(void) {
-    static __thread char id[96];  // (per thread: the precompile's workers ask for it at once)
-    snprintf(id, sizeof id, "%s%s%s", TRANSLATOR_ID, opt_static_stacks() ? "" : "-ss0", opt_goto_elim() ? "" : "-ge0");
+    static __thread char id[128];  // (per thread: the precompile's workers ask for it at once)
+    char pc[16] = "";
+    if (maxwell_push_cb()) snprintf(pc, sizeof pc, "-pc%u%s", maxwell_push_cap, opt_push_vs() ? "" : "v0");
+    snprintf(id, sizeof id, "%s%s%s%s%s", TRANSLATOR_ID, opt_static_stacks() ? "" : "-ss0", opt_goto_elim() ? "" : "-ge0",
+             maxwell_inline_c1() ? "-c1" : "", pc);
     return id;
 }
 

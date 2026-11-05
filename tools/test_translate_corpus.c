@@ -43,6 +43,9 @@ int main(int argc, char **argv) {
     if (!shader_archive_scan(argv[1], &set, NULL, NULL, why, sizeof why)) { fprintf(stderr, "%s\n", why); return 1; }
     maxwell_gmem_base = 0x1000000000ull;  // (any heap: global memory addresses are relative to it)
     maxwell_gmem_size = 0xC0000000ull;
+#ifdef HAVE_CONST_DATA
+    maxwell_push_cap = 64;  // (a 256-byte push range: PanVK, Turnip)
+#endif
     int n[3] = {0}, failed[3] = {0}, branchy[3] = {0}, machine[3] = {0};
     static const char *const ext[3] = {"vert", "frag", "comp"};
     for (int i = 0; i < set.nshaders; i++) {
@@ -56,8 +59,8 @@ int main(int argc, char **argv) {
         if (k == 2) key.shared_size = s->shared;
 #ifdef HAVE_CONST_DATA
         // (c1: the compiler constants after the code, at the control section's constant offset)
-        maxwell_const_data = s->max_size < s->size ? s->code + s->max_size : NULL;
-        maxwell_const_size = s->max_size < s->size ? s->size - s->max_size : 0;
+        maxwell_const_data = s->const_size && k != 2 ? s->code + s->max_size : NULL;  // (compute: none, as exec.c)
+        maxwell_const_size = s->const_size && k != 2 ? s->const_size : 0;
 #endif
         size_t head = k == 2 ? 0 : 0x80;
         size_t bin = maxwell_binary_size(s->code, s->max_size, s->stage);
