@@ -43,6 +43,10 @@ int main(int argc, char **argv) {
     if (!shader_archive_scan(argv[1], &set, NULL, NULL, why, sizeof why)) { fprintf(stderr, "%s\n", why); return 1; }
     maxwell_gmem_base = 0x1000000000ull;  // (any heap: global memory addresses are relative to it)
     maxwell_gmem_size = 0xC0000000ull;
+#ifdef HAVE_GMEM_MIRROR
+    // TT_GMEM_MIRROR=1: global memory through the copies' table (no heap import: exec.c gmir_)
+    maxwell_gmem_mirror = getenv("TT_GMEM_MIRROR") && atoi(getenv("TT_GMEM_MIRROR")) != 0;
+#endif
 #ifdef HAVE_CONST_DATA
     maxwell_push_cap = 64;  // (a 256-byte push range: PanVK, Turnip)
 #endif

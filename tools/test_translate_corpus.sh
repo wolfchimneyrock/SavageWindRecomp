@@ -2,7 +2,7 @@
 # The translator over the game's own shaders (tools/test_translate_corpus.c): every vertex, fragment and compute binary
 # of the RomFS's shader archives translated to GLSL with the switches in the environment, each compiled with
 # glslangValidator (Vulkan 1.3, as runtime/nvn/vulkan/spirv.c's shaderc).
-# usage: [SAVAGEWIND_...=...] tools/test_translate_corpus.sh <extracted/romfs folder> [name] [jobs]
+# usage: [SAVAGEWIND_...=...] [TT_GMEM_MIRROR=1] tools/test_translate_corpus.sh <extracted/romfs folder> [name] [jobs]
 # The GLSL goes to build/test_corpus/<name>/ (default: "run"); exits 1 when any translation doesn't compile.
 # Needs a C compiler and glslangValidator.
 set -e
@@ -17,6 +17,7 @@ rm -f "$OUT/$NAME"/*.vert "$OUT/$NAME"/*.frag "$OUT/$NAME"/*.comp "$OUT/$NAME"/g
 DEFS=""
 grep -q maxwell_const_data runtime/nvn/maxwell/shader.h && DEFS="-DHAVE_CONST_DATA"
 grep -q MAXWELL_FLOW_CHECK runtime/nvn/maxwell/translate.c && DEFS="$DEFS -DMAXWELL_FLOW_CHECK"
+grep -q maxwell_gmem_mirror runtime/nvn/maxwell/shader.h && DEFS="$DEFS -DHAVE_GMEM_MIRROR"
 $CC -O2 -w $DEFS -Iruntime -Iruntime/nvn tools/test_translate_corpus.c runtime/nvn/maxwell/translate.c \
   runtime/nvn/shader_archive.c runtime/romfs_image.c runtime/romfs_build.c -o "$OUT/test_translate_corpus" -lpthread -lm
 "$OUT/test_translate_corpus" "$ROMFS" "$OUT/$NAME" 2> "$OUT/$NAME/stderr.txt" | tee "$OUT/$NAME/summary.txt"

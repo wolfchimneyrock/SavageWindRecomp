@@ -255,6 +255,8 @@ int main(int argc, char **argv) {
     bool do_msl = strcmp(mode, "glsl") != 0, do_glsl = strcmp(mode, "msl") != 0;
     maxwell_gmem_base = 0x80000000ull;
     maxwell_gmem_size = 0x10000000ull;
+    // TT_GMEM_MIRROR=1: global memory through the copies' table (no heap import: exec.c gmir_)
+    maxwell_gmem_mirror = getenv("TT_GMEM_MIRROR") && atoi(getenv("TT_GMEM_MIRROR")) != 0;
 #ifdef MSL_REF
     old_maxwell_gmem_base = maxwell_gmem_base;
     old_maxwell_gmem_size = maxwell_gmem_size;
