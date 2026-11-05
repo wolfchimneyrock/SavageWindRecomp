@@ -83,6 +83,8 @@ static int add_shader(SaSet *set, int stage, const uint8_t *code, size_t size, c
     s->stage = (uint8_t)stage;
     s->size = (uint32_t)size;
     s->max_size = co ? co : 0x10000;
+    s->const_size = co && co < size ? rd32(ctl + 0x6FC) : 0;
+    if (s->const_size > size - co) s->const_size = (uint32_t)(size - co);
     if (stage == STAGE_COMPUTE) {
         for (int k = 0; k < 3; k++) s->local[k] = rd32(ctl + 0x748 + 4 * k) ? rd32(ctl + 0x748 + 4 * k) : 1;
         s->shared = rd32(ctl + 0x754);

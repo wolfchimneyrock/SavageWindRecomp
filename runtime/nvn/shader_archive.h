@@ -22,6 +22,7 @@ typedef struct {
     uint32_t size;              // bytes of code as the game uploads it (graphics: 0x30-byte NVN header, SPH, code)
     uint32_t max_size;          // what the runtime passes as the code's size: the control section's constant
                                 // offset, or 0x10000
+    uint32_t const_size;        // its compiler constants' bytes (c1, at code + max_size; control section 0x6FC)
     uint32_t local[3], shared;  // compute: group size and shared memory bytes (control section)
     uint64_t hash;              // of the code the translator reads (shader_code_hash)
     uint8_t *code;
