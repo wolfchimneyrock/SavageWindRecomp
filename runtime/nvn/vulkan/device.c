@@ -64,7 +64,7 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBi
 static void create_instance(void) {
     Uint32 n_sdl = 0;
     const char *const *sdl_ext = SDL_Vulkan_GetInstanceExtensions(&n_sdl);
-    const char *ext[24];
+    const char *ext[28];
     uint32_t n_ext = 0;
     for (Uint32 i = 0; i < n_sdl && n_ext < 14; i++) ext[n_ext++] = sdl_ext[i];
     {   // the HDR10 colour space of an HDR swapchain (Video > HDR) comes with VK_EXT_swapchain_colorspace
@@ -255,6 +255,42 @@ static bool radv_gcn(void) {
 static bool radv_gfx12(void) { return strstr(g_vk.props.deviceName, "(RADV GFX12") != NULL; }
 bool vk_shader_fp16(void) { return g_vk.fp16; }
 
+// SAVAGEWIND_VK_SHADER_STATS=1 (tuning shaders): each pipeline's statistics from the driver
+// (VK_KHR_pipeline_executable_properties: registers, spills, instruction and cycle counts), one "[stats]" line per
+// stage, labelled with its shaders (vk_stats_label, exec.c). The pipelines are then made whole and not cached.
+bool g_shader_stats;
+__thread char g_stats_label[160];
+void vk_log_pipeline_stats(VkPipeline p) {
+    PFN_vkGetPipelineExecutablePropertiesKHR props =
+        (PFN_vkGetPipelineExecutablePropertiesKHR)vkGetDeviceProcAddr(g_vk.dev, "vkGetPipelineExecutablePropertiesKHR");
+    PFN_vkGetPipelineExecutableStatisticsKHR stats =
+        (PFN_vkGetPipelineExecutableStatisticsKHR)vkGetDeviceProcAddr(g_vk.dev, "vkGetPipelineExecutableStatisticsKHR");
+    if (!props || !stats || !p) return;
+    VkPipelineInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, .pipeline = p};
+    VkPipelineExecutablePropertiesKHR ep[8];
+    uint32_t ne = 8;
+    for (uint32_t i = 0; i < ne; i++) ep[i] = (VkPipelineExecutablePropertiesKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR};
+    if (props(g_vk.dev, &pi, &ne, ep) < 0) return;
+    for (uint32_t e = 0; e < ne; e++) {
+        VkPipelineExecutableInfoKHR ei = {.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, .pipeline = p, .executableIndex = e};
+        VkPipelineExecutableStatisticKHR st[32];
+        uint32_t ns = 32;
+        for (uint32_t i = 0; i < ns; i++) st[i] = (VkPipelineExecutableStatisticKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR};
+        if (stats(g_vk.dev, &ei, &ns, st) < 0) continue;
+        char line[1024];
+        int l = snprintf(line, sizeof line, "[stats] %s | %s:", g_stats_label, ep[e].name);
+        for (uint32_t i = 0; i < ns && l < (int)sizeof line - 48; i++) {
+            switch (st[i].format) {
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: l += snprintf(line + l, sizeof line - l, " %s=%u", st[i].name, st[i].value.b32); break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: l += snprintf(line + l, sizeof line - l, " %s=%lld", st[i].name, (long long)st[i].value.i64); break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: l += snprintf(line + l, sizeof line - l, " %s=%llu", st[i].name, (unsigned long long)st[i].value.u64); break;
+            default: l += snprintf(line + l, sizeof line - l, " %s=%.3f", st[i].name, st[i].value.f64);
+            }
+        }
+        LOG("%s\n", line);
+    }
+}
+
 static void create_device(void) {
     uint32_t ne = 0;
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
@@ -354,6 +390,9 @@ static void create_device(void) {
     // when each frame reached the display (SAVAGEWIND_LOG_PRESENT, tests: "present timing" below)
     bool pwait = getenv("SAVAGEWIND_LOG_PRESENT") && has_ext(ep, ne, VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
                  has_ext(ep, ne, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+    // SAVAGEWIND_VK_SHADER_STATS=1: each pipeline's statistics from the driver (vk_log_pipeline_stats above)
+    bool pexec = getenv("SAVAGEWIND_VK_SHADER_STATS") && atoi(getenv("SAVAGEWIND_VK_SHADER_STATS")) &&
+                 has_ext(ep, ne, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
     free(ep);
 
     // features the backend relies on (all present on current desktop drivers)
@@ -528,6 +567,21 @@ static void create_device(void) {
         ext[n_ext++] = VK_KHR_PRESENT_WAIT_EXTENSION_NAME;
     }
     g_vk.present_wait = pwait;
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pexec_have = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+    if (pexec) {
+        VkPhysicalDeviceFeatures2 q = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &pexec_have};
+        vkGetPhysicalDeviceFeatures2(g_vk.phys, &q);
+        pexec = pexec_have.pipelineExecutableInfo;
+    }
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pexec_on = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR, .pipelineExecutableInfo = VK_TRUE};
+    if (pexec) {
+        pexec_on.pNext = f.pNext, f.pNext = &pexec_on;
+        ext[n_ext++] = VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME;
+        g_shader_stats = true;
+        LOG("[vk] shader statistics on (SAVAGEWIND_VK_SHADER_STATS): a [stats] line per pipeline stage, pipelines made whole, not cached\n");
+    }
     float prio[2] = {1.0f, 1.0f};
     // One queue: frames are presented on the game's own. A second one that presented (present thread below) went
     // wrong with others' code on it: NVIDIA's GPUs before Turing faulted writing to GPU address 0 within the first
@@ -1914,6 +1968,18 @@ presented:
         extern bool g_gpuprof_frame;
         extern void vk_gpuprof_report(void);
         if (g_gpuprof_frame) { g_gpuprof_frame = false; vk_gpuprof_report(); }
+        // SAVAGEWIND_GPUPROF_FILE=<path>: on demand. When that file appears (looked for every 60 frames) it is removed
+        // and 10 frames half a second apart are profiled (an A/B at one spot: touch the file while standing still)
+        static const char *pf;
+        static int pf_init;
+        static uint64_t pf_next, pf_left;
+        if (!pf_init) { pf_init = 1; pf = getenv("SAVAGEWIND_GPUPROF_FILE"); }
+        if (pf && !pf_left && total_frames % 60 == 0 && access(pf, F_OK) == 0) {
+            unlink(pf);
+            pf_left = 10, pf_next = total_frames + 1;
+            LOG("[gpuprof] on demand: 10 frames from %llu\n", (unsigned long long)pf_next);
+        }
+        if (pf_left && total_frames == pf_next) { g_gpuprof_frame = true; pf_left--; pf_next = total_frames + 30; }
         const char *e = getenv("SAVAGEWIND_GPUPROF_AT");
         for (const char *p = e; p && *p;) {
             long at = strtol(p, (char **)&p, 10);

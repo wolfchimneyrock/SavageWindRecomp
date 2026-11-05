@@ -2987,6 +2987,19 @@ static void cache_feedback(const VkPipelineCreationFeedback *fb) {
 
 static VkResult create_pipeline_in(const PipeState *k, VkShaderModule vsm, VkShaderModule fsm, VkPipelineLayout layout,
                                    VkPipelineCache cache, VkPipeline *out);
+// SAVAGEWIND_VK_SHADER_STATS (device.c): the driver's statistics of each pipeline made, labelled with its shaders'
+// translation ids (as SAVAGEWIND_SAVE_MSL's GLSL and the pre-warm records name them) and, for a draw, the fragment
+// shader's address and hash (as [draw] and the GPU profile show them)
+extern bool g_shader_stats;
+extern __thread char g_stats_label[160];
+void vk_log_pipeline_stats(VkPipeline p);
+static void stats_label(const ShaderInfo *vi, const ShaderInfo *fi, uint64_t fa) {
+    uint64_t fh = fa ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fa + 0x30), 0x200) : 0;
+    snprintf(g_stats_label, sizeof g_stats_label, "vs %016llx fs %016llx fs at %llx fsh %016llx",
+             (unsigned long long)vk_translate_id(vi), (unsigned long long)vk_translate_id(fi), (unsigned long long)fa,
+             (unsigned long long)fh);
+}
+
 static VkResult create_pipeline(const PipeState *k, VkShaderModule vsm, VkShaderModule fsm, VkPipelineLayout layout, VkPipeline *out) {
     return create_pipeline_in(k, vsm, fsm, layout, g_vk.pcache, out);
 }
@@ -3051,6 +3064,7 @@ static VkResult create_pipeline_in(const PipeState *k, VkShaderModule vsm, VkSha
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = layout,
                                        .flags = k->feedback ? VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT : 0};
+    if (g_shader_stats) pi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR, cache = VK_NULL_HANDLE;
     *out = VK_NULL_HANDLE;
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, cache, 1, &pi, NULL, out);
     if (r != VK_SUCCESS) {
@@ -3059,6 +3073,7 @@ static VkResult create_pipeline_in(const PipeState *k, VkShaderModule vsm, VkSha
     } else if (cache == g_vk.pcache) {
         cache_feedback(&fb);
     }
+    if (r == VK_SUCCESS && g_shader_stats) vk_log_pipeline_stats(*out);
     return r;
 }
 
@@ -3295,7 +3310,7 @@ static VkPipeline gpl_state_lib(const PipeState *s, bool output) {
 // A graphics pipeline: linked from libraries (g_vk.gpl), else whole
 static VkResult make_graphics(const PipeState *s, StageBuild *v, StageBuild *f, VkShaderModule vsm, VkShaderModule fsm,
                               VkPipelineLayout layout, VkPipeline *out) {
-    if (g_vk.gpl && v && f && !s->feedback) {
+    if (g_vk.gpl && v && f && !s->feedback && !g_shader_stats) {  // (SAVAGEWIND_VK_SHADER_STATS: whole, the stats of both stages)
         VkPipeline libs[4] = {gpl_state_lib(s, false), gpl_stage_lib(v, STAGE_VERTEX, s), gpl_stage_lib(f, STAGE_FRAGMENT, s),
                               gpl_state_lib(s, true)};
         if (libs[0] && libs[1] && libs[2] && libs[3]) {
@@ -3380,6 +3395,7 @@ static void build_pipeline(void *arg) {
     WarmPipe *w;
     if (warm_get(k->prog->vi, k->prog->fi, &k->s, &w)) {
         VkPipeline p;
+        if (g_shader_stats) stats_label(k->prog->vi, k->prog->fi, k->prog->code[1]);
         VkResult r = make_graphics(&k->s, k->prog->stages.v, k->prog->stages.f, k->prog->vs, k->prog->fs, k->prog->layout, &p);
         warm_done(w, p, r);
         if (r == VK_SUCCESS) pso_record(1, vk_translate_id(k->prog->vi), vk_translate_id(k->prog->fi), &k->s, sizeof k->s);
@@ -5737,8 +5753,14 @@ static void cs_make(CsBuild *c) {
                                                     .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main",
                                                     .pSpecializationInfo = &spec},
                                           .layout = c->layout};
-        r = m ? vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &ci, NULL, &c->pipe) : VK_ERROR_INVALID_SHADER_NV;
-        if (r == VK_SUCCESS) cache_feedback(&fb);
+        if (g_shader_stats) {
+            ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+            snprintf(g_stats_label, sizeof g_stats_label, "cs %016llx", (unsigned long long)vk_translate_id(c->si));
+        }
+        r = m ? vkCreateComputePipelines(g_vk.dev, g_shader_stats ? VK_NULL_HANDLE : g_vk.pcache, 1, &ci, NULL, &c->pipe)
+              : VK_ERROR_INVALID_SHADER_NV;
+        if (r == VK_SUCCESS && g_shader_stats) vk_log_pipeline_stats(c->pipe);
+        else if (r == VK_SUCCESS) cache_feedback(&fb);
         else LOG("[compute] pipeline failed: %d\n", r);
     }
     pthread_mutex_lock(&warm_lock);
@@ -5994,6 +6016,7 @@ static void pso_warm_one(const PsoRec *r) {
         WarmPipe *w;
         if (!warm_get(vi, fi, &r->u.g, &w)) { atomic_fetch_add(&pso_found, 1); return; }
         VkPipeline p;
+        if (g_shader_stats) stats_label(vi, fi, 0);
         VkResult res = make_graphics(&r->u.g, b->v, b->f, b->vs, b->fs, b->layout, &p);
         warm_done(w, p, res);
     } else {
