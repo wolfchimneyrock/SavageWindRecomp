@@ -2721,13 +2721,14 @@ static bool opt_goto_elim(void) {
     return v;
 }
 // (the switches above change translations: they name caches of their own)
+static bool opt_force_la(void);
 const char *maxwell_translator_id(void) {
     static __thread char id[128];  // (per thread: the precompile's workers ask for it at once)
     char pc[16] = "";
     if (maxwell_push_cb()) snprintf(pc, sizeof pc, "-pc%u%s", maxwell_push_cap, opt_push_vs() ? "" : "v0");
-    snprintf(id, sizeof id, "%s%s%s%s%s%s%s%s%s", TRANSLATOR_ID, maxwell_gmem_split ? "-gs" : "", maxwell_gmem_snap ? "-gn" : "",
+    snprintf(id, sizeof id, "%s%s%s%s%s%s%s%s%s%s", TRANSLATOR_ID, maxwell_gmem_split ? "-gs" : "", maxwell_gmem_snap ? "-gn" : "",
              opt_static_stacks() ? "" : "-ss0", opt_goto_elim() ? "" : "-ge0", maxwell_inline_c1() ? "-c1" : "", pc,
-             maxwell_cb_vec4() ? "-v4" : "", maxwell_gmem_mirror ? "-gm" : "");
+             maxwell_cb_vec4() ? "-v4" : "", maxwell_gmem_mirror ? "-gm" : "", opt_force_la() ? "-la" : "");
     return id;
 }
 
@@ -2940,6 +2941,13 @@ static void structure_flow(Ctx *c, const uint64_t *code, size_t end) {
 static bool opt_no_structure(void) {
     static int v = -1;
     if (v < 0) v = getenv("SAVAGEWIND_XLATE_NO_STRUCTURE") != NULL;
+    return v;
+}
+// SAVAGEWIND_XLATE_FORCE_LA_STRUCT=1 (measuring): structure_flow skipped, every shader with branches through the
+// static stacks and goto elimination (what it can't take keeps the state machine). Default off.
+static bool opt_force_la(void) {
+    static int v = -1;
+    if (v < 0) v = opt_env("SAVAGEWIND_XLATE_FORCE_LA_STRUCT", false);
     return v;
 }
 // Whether a flow instruction that can run (not @!PT) is conditional: its predicate, or its condition-code test
@@ -3981,7 +3989,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
             any_branch = true;
         (void)is_branch_target_op;
     }
-    if (c->glsl && any_branch) structure_flow(c, (const uint64_t *)code, end);
+    if (c->glsl && any_branch && !opt_force_la()) structure_flow(c, (const uint64_t *)code, end);
     // what structure_flow refuses: the stacks resolved statically, then (with them) goto elimination
     Ast *plan = NULL;
     SBlock *sblk = NULL;
