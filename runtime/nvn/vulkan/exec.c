@@ -539,10 +539,11 @@ void vk_translator_setup(void) {
                                                     drv.driverID == VK_DRIVER_ID_AMD_PROPRIETARY;
     maxwell_gmem_snap = gsnap_mode() != 0;
     if (maxwell_gmem_mirror) maxwell_gmem_split = maxwell_gmem_snap = false;  // (the copies: no heap binding at all)
-    // c1 inlined and the hot constant buffer words as push constants (translate.c): off by default (in LAS Recomp they
-    // help Mesa's PanVK, which reads constant buffers from memory every time; not yet measured here).
-    // SAVAGEWIND_VK_INLINE_C1 / SAVAGEWIND_VK_PUSH_CB =1 turn them on.
-    maxwell_glsl_push = false;
+    // c1 inlined and the hot constant buffer words as push constants (translate.c): on by default on Mali (Arm's driver
+    // and Mesa's PanVK, which reads constant buffers from memory every time: LAS Recomp #563) and Adreno (Qualcomm
+    // vendor 0x5143, Turnip: LAS Recomp #579), off elsewhere. SAVAGEWIND_VK_INLINE_C1 / SAVAGEWIND_VK_PUSH_CB =0 / 1
+    // override.
+    maxwell_glsl_push = g_vk.is_mali || g_vk.props.vendorID == 0x5143;
     maxwell_glsl_cb_vec4 = g_vk.is_mali;  // (SAVAGEWIND_VK_CB_VEC4: Mali wins, Turnip loses vertex instructions)
     uint32_t pcw = g_vk.props.limits.maxPushConstantsSize / 4;
     maxwell_push_cap = pcw < 64 ? pcw : 64;
