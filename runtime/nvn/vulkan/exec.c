@@ -842,8 +842,10 @@ static bool oneshot_queries(void) {
 }
 
 static void wait_seq_(uint64_t seq);
+static void gw_inval_done(uint64_t done);
 void renderer_wait_seq(uint64_t seq) {
     wait_seq_(seq);
+    gw_inval_done(vk_completed_seq());  // (non-coherent heap: the GPU's writes the game may read now)
     gmir_writeback();  // (what the GPU stored, in guest memory before the game reads it)
 }
 static void wait_seq_(uint64_t seq) {
@@ -2078,6 +2080,7 @@ static void begin_pass(void) {
         }
     }
     pass_ds_written = false;
+    gw_inval_done(vk_completed_seq());  // (non-coherent heap: the GPU's finished writes)
     pass_color_written = pass_color_unsynced = pass_feedback = 0;
     det_written = 0;
     if (dl_on == 2) renderer_flush();  // (SAVAGEWIND_VK_DEVLOST_TRACE=2: each pass its own submission)
@@ -4867,6 +4870,61 @@ static const uint8_t *cbuf_cpu(int stage, const ShaderInfo *si, int k, uint64_t 
     return (const uint8_t *)(uintptr_t)r.addr;
 }
 
+// ---- A heap import the CPU caches without coherency (Mali-G610 with Arm's driver: a host-pointer import can only be
+// memory type 1, HOST_VISIBLE | HOST_CACHED without HOST_COHERENT). What the CPU just wrote may still sit in its
+// caches when the GPU reads the heap, and the CPU may keep stale lines of what the GPU wrote (LAS Recomp #546: grass
+// and shadows flashing, objects gone for a frame). There, every range the GPU reads from the heap in place is written
+// back first (DC CVAC: the storage buffers a stage binds, vertex / index / constant data read in place, the heap
+// copy's sources), and the ranges a storing shader binds are written back and invalidated (DC CIVAC) when it is
+// recorded - no dirty CPU line can land on its results later - and again once its submission is done (the game's
+// fence wait, each pass start). Elsewhere (coherent memory: desktop GPUs) nothing changes.
+// SAVAGEWIND_VK_CACHE_CLEAN=0 / 1: off / on whatever the memory type.
+static int heap_cc = -1;  // -1 not known yet (no import), 0 coherent, 1 not
+static void heap_note_type(uint32_t type) {  // (each heap import: the memory type it took)
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+    int nc = type < mp.memoryTypeCount && !(mp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    const char *e = getenv("SAVAGEWIND_VK_CACHE_CLEAN");
+    if (e) nc = atoi(e) != 0;
+    if (heap_cc != nc)
+        LOG("[vk] guest heap: memory type %u, %s%s\n", type,
+            nc ? "not coherent: CPU caches written back / invalidated around the GPU's use" : "coherent", e ? " (SAVAGEWIND_VK_CACHE_CLEAN)" : "");
+    heap_cc = nc;
+}
+static bool heap_noncoherent(void) { return heap_cc > 0; }
+static inline void heap_clean(uint64_t addr, uint64_t size) {  // (before the GPU reads [addr, addr+size) of the heap)
+    if (heap_cc > 0 && addr >= HEAP_BASE && size && addr - HEAP_BASE < HEAP_MAX) plat_cache_op(addr, size, false);
+}
+static void heap_clean_sbufs(int stage) {  // (a stage's storage buffers, read in place)
+    if (heap_cc > 0)
+        for (int i = 0; i < 16; i++) heap_clean(st.sbuf[stage][i].addr, st.sbuf[stage][i].size);
+}
+// the ranges a storing shader has bound: written back and invalidated when it is recorded and again once its
+// submission is done
+#define GW_INV_MAX 8192
+static struct { uint64_t lo, hi, seq; } gw_inv[GW_INV_MAX];
+static int ngw_inv;
+static pthread_mutex_t gw_inv_lock = PTHREAD_MUTEX_INITIALIZER;
+static void gw_inval_add(uint64_t a, uint64_t sz) {
+    if (heap_cc <= 0 || a < HEAP_BASE || !sz || a - HEAP_BASE >= HEAP_MAX) return;
+    plat_cache_op(a, sz, true);
+    pthread_mutex_lock(&gw_inv_lock);
+    // (full - not seen in play: this range only gets the write-back above)
+    if (ngw_inv < GW_INV_MAX) gw_inv[ngw_inv].lo = a, gw_inv[ngw_inv].hi = a + sz, gw_inv[ngw_inv].seq = vk_pending_seq(), ngw_inv++;
+    pthread_mutex_unlock(&gw_inv_lock);
+}
+static void gw_inval_done(uint64_t done) {
+    if (!heap_noncoherent() || !ngw_inv) return;
+    pthread_mutex_lock(&gw_inv_lock);
+    int o = 0;
+    for (int i = 0; i < ngw_inv; i++) {
+        if (gw_inv[i].seq <= done) plat_cache_op(gw_inv[i].lo, gw_inv[i].hi - gw_inv[i].lo, true);
+        else gw_inv[o++] = gw_inv[i];
+    }
+    ngw_inv = o;
+    pthread_mutex_unlock(&gw_inv_lock);
+}
+
 // Global memory (shader LDG/STG, maxwell_gmem_base = HEAP_BASE): on Windows, sparse-bind committed guest pages
 // imported with VK_EXT_external_memory_host; other paths retain the whole-heap import. GPU writes land in guest
 // memory. SAVAGEWIND_VK_NO_GMEM=1: no import, reads return zero.
@@ -4929,6 +4987,7 @@ static bool gmem_import(uint64_t size) {
     LOG("[vk] guest heap memory type %u on heap %u (%llu MB, flags %#x)%s\n",
         memory_type, chosen_heap, (unsigned long long)(memory.memoryHeaps[chosen_heap].size >> 20), chosen_flags,
         (chosen_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? "" : " (non-device-local preferred)");
+    heap_note_type(memory_type);
     VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
                                            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = size,
@@ -5394,6 +5453,7 @@ static void heap_dmaheap(uint64_t size) {
         heap_unmap(size);
         return;
     }
+    heap_note_type(type);
     char how[96];
     snprintf(how, sizeof how, "dma-buf from %s mapped at the heap, imported as type %u", path, type);
     extern uint64_t g_mem_direct_lo, g_mem_direct_hi;  // (control_mem.h: the control peeks copy in place here)
@@ -5545,6 +5605,7 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
     if (gmem_sparse) gmem_info();
     if (!gmem_mapped && addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
     if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;
+    heap_clean(addr, size);  // (read in place)
     *buf = gmem_buf;
     *off = addr - HEAP_BASE;
     return true;
@@ -5622,7 +5683,9 @@ static bool gw_add(uint64_t lo, uint64_t hi) {  // false: no room
 
 static void gsnap_gpu_note(int stage);
 static void gw_note(int stage) {  // a shader of this stage that stores to global memory was recorded
-    if (gsnap_mode()) gsnap_gpu_note(stage);  // (the GPU data list is read only by the copies: gsnap on)
+    if (gsnap_mode()) gsnap_gpu_note(stage);
+    if (heap_noncoherent())  // (non-coherent heap: no dirty CPU line may land on its results)
+        for (int i = 0; i < 16; i++) gw_inval_add(st.sbuf[stage][i].addr, st.sbuf[stage][i].size);  // (the GPU data list is read only by the copies: gsnap on)
     vtx_hazard = true;  // (the next pass's vertex stage may read it)
     static int hold = -1;
     if (hold < 0) hold = getenv("SAVAGEWIND_VK_GMEM_HOLD") != NULL;
@@ -6469,6 +6532,7 @@ static void hc_copy_flush(VkCommandBuffer *cb, VkBuffer dst, VkBufferCopy *rg, i
         rec_CmdPipelineBarrier2(*cb, &(VkDependencyInfo){.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
                                                          .pMemoryBarriers = &mb});
     }
+    for (int i = 0; i < *nrg; i++) heap_clean(HEAP_BASE + rg[i].srcOffset, rg[i].size);  // (the copy reads memory)
     rec_CmdCopyBuffer(*cb, gmem_buf, dst, (uint32_t)*nrg, rg);
     for (int i = 0; i < *nrg; i++) hc_stat_bytes += rg[i].size;
     hc_stat_runs += (uint64_t)*nrg;
@@ -7171,6 +7235,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                   : b->binding == GSNAP_BUFFER_INDEX   ? gsnap_info(stage)
                   : b->binding == GMEM2_BUFFER_INDEX   ? gmem_info_hi()
                                                        : gmem_info();
+            if (b->binding == GMEM_BUFFER_INDEX && !gmir_on()) heap_clean_sbufs(stage);  // (non-coherent heap: read in place)
             w[n].pBufferInfo = &bi[n];
         } else {
             continue;  // rscale / tint: written below, once the textures (and their scales) are known
