@@ -183,6 +183,7 @@ static void *run(void *arg) {
     prof_thread_name("vk-record");
     extern void control_prof_thread(const char *name);  // runtime/control_prof.c (`threads`)
     control_prof_thread("recorder");
+    plat_thread_perf_core(PLAT_PERF_RENDER);
     uint64_t t = 0;
     for (;;) {
         uint64_t h = atomic_load_explicit(&head, memory_order_acquire);

@@ -1139,6 +1139,7 @@ static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
 static void *worker(void *a) {
     (void)a;
     prof_thread_name("shader-worker");
+    plat_thread_default_core();  // (not the big cores of the thread that started it: platform.h)
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
         while (!jobs_head) pthread_cond_wait(&jobs_cond, &jobs_lock);
@@ -1173,6 +1174,7 @@ static pthread_cond_t tjobs_cond = PTHREAD_COND_INITIALIZER;
 static void *translator(void *a) {
     (void)a;
     prof_thread_name("translator");
+    plat_thread_default_core();
     for (;;) {
         pthread_mutex_lock(&tjobs_lock);
         while (!tjobs_head) pthread_cond_wait(&tjobs_cond, &tjobs_lock);
@@ -6301,6 +6303,7 @@ static bool hc_on(void) {
 // (thread) makes the chunks asked for (HC_MAKING): a buffer of video memory each, outside the lock
 static void *hc_maker(void *arg) {
     (void)arg;
+    plat_thread_default_core();
     pthread_mutex_lock(&hc_make_lock);
     for (;;) {
         while (!hc_make_req) pthread_cond_wait(&hc_make_cond, &hc_make_lock);
@@ -7639,6 +7642,7 @@ static void pso_warm_one(const PsoRec *r) {
 static void *pso_worker(void *arg) {
     (void)arg;
     prof_thread_name("pso-worker");
+    plat_thread_default_core();
     // (debugging) SAVAGEWIND_PSO_SLOW_MS=<n>: each pipeline takes n ms longer, to see the wait and its bar (device.c
     // then saves the first bar frame as build/pso_wait.png)
     int slow = getenv("SAVAGEWIND_PSO_SLOW_MS") ? atoi(getenv("SAVAGEWIND_PSO_SLOW_MS")) : 0;

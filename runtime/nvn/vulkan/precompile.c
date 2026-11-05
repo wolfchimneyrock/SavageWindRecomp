@@ -50,6 +50,7 @@
 #include "../shader_archive.h"
 #include "shaders.h"
 #include "vk.h"
+#include "../../platform.h"
 
 bool shader_precompile_available(void) { return true; }
 
@@ -88,6 +89,7 @@ typedef struct {
 
 static void *worker(void *arg) {
     Work *w = arg;
+    plat_thread_default_core();  // (all cores: platform.h)
     maxwell_gmem_base = HEAP_BASE;  // (as the game translates: global memory relative to the guest heap)
     maxwell_gmem_size = HEAP_MAX;
     for (int i; !atomic_load(&w->p->cancel) && (i = atomic_fetch_add(&w->next, 1)) < w->njobs;) {
@@ -153,6 +155,7 @@ static int by_need_desc(const void *a, const void *b) {
 
 static void *pipe_worker(void *arg) {
     Work *w = arg;
+    plat_thread_default_core();
     int64_t mb;
     for (int i; (i = pipe_take(w, &mb)) >= 0;) {
         const Pair *pr = &w->pairs[i];

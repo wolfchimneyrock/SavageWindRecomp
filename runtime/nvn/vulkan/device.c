@@ -28,6 +28,7 @@
 #include "fsr_api.h"
 #include "../output_scale.h"
 #include "../renderer.h"
+#include "../../platform.h"
 
 #ifdef _WIN32  // (kernel32; windows.h itself clashes with names used here)
 __declspec(dllimport) int __stdcall MoveFileExA(const char *from, const char *to, unsigned long flags);
@@ -1329,6 +1330,7 @@ bool vk_precompiled_cache_save(void) {
 
 static void *pc_saver(void *arg) {
     (void)arg;
+    plat_thread_default_core();
     for (;;) {
         SDL_Delay(1000);
         extern void vk_pso_flush(void);

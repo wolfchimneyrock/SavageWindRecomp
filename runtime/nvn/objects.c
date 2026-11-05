@@ -8,6 +8,7 @@
 #include "../prof.h"
 #include "../perfmon.h"
 #include "nvn.h"
+#include "../platform.h"
 
 void renderer_sync(void);
 
@@ -224,6 +225,7 @@ static void qop_run(const QOp *o) {
 static void *queue_thread(void *arg) {
     (void)arg;
     prof_thread_name("nvn-queue");
+    plat_thread_perf_core(PLAT_PERF_RENDER);
     kernel_sample_host_thread();
     extern void control_prof_thread(const char *name);  // runtime/control_prof.c (`threads`)
     control_prof_thread("render");

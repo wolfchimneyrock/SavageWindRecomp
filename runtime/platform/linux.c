@@ -9,6 +9,8 @@
 #include <dirent.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,8 +74,12 @@ void plat_sleep_until_ns(uint64_t t) {
 
 void plat_wait_until_ns(uint64_t t) { plat_sleep_until_ns(t); }  // (clock_nanosleep doesn't spin)
 
+// (plat_thread_perf_core below) the process's cores, not the calling thread's: a thread on the big cores counts them all
+static bool pcore_process_set(cpu_set_t *s);
+static void pcore_restrict(const cpu_set_t *one);
 int plat_cpu_count(void) {
     cpu_set_t s;
+    if (pcore_process_set(&s) && CPU_COUNT(&s) > 0) return CPU_COUNT(&s);
     if (sched_getaffinity(0, sizeof s, &s) == 0 && CPU_COUNT(&s) > 0) return CPU_COUNT(&s);
     return SDL_GetNumLogicalCPUCores();
 }
@@ -103,7 +109,7 @@ static int core_first(int cpu, const cpu_set_t *all) {
 // SMT siblings within the process's affinity, set on every thread the process has so far (later ones inherit it).
 void plat_cpu_placement(void) {
     cpu_set_t all, one;
-    if (sched_getaffinity(0, sizeof all, &all)) return;
+    if (!pcore_process_set(&all) && sched_getaffinity(0, sizeof all, &all)) return;
     CPU_ZERO(&one);
     int logical = CPU_COUNT(&all), cores = 0;
     for (int c = 0; c < CPU_SETSIZE; c++)
@@ -117,6 +123,156 @@ void plat_cpu_placement(void) {
     for (struct dirent *e; d && (e = readdir(d));)
         if (e->d_name[0] != '.') sched_setaffinity((pid_t)atoi(e->d_name), sizeof one, &one);
     if (d) closedir(d);
+    pcore_restrict(&one);
+}
+
+// The frame's critical threads on the big cores of a big.LITTLE / hybrid CPU (LAS Recomp #533). The scheduler places a
+// thread by its recent load, so a thread idle for part of each frame often lands on a little core: on an RK3588 the
+// game's threads ran on the A55s much of the time and frames missed their 33 ms. A core's class: its cpu_capacity
+// (arm64, from the device tree), else (Intel hybrid) the kernel's cpu_core / cpu_atom lists, else its highest
+// frequency where the slowest is under 80 % of the fastest. "Big" = every class above the lowest, within the process
+// affinity. SAVAGEWIND_PCORE=0: off.
+static pthread_once_t pcore_once = PTHREAD_ONCE_INIT;
+static cpu_set_t pcore_set, pcore_all;  // the big cores; the process's own cores (plat_thread_default_core)
+static int pcore_n;  // 0: no selection (off, not hybrid, or the affinity allows only one class)
+
+static long cpu_sysfs_long(int cpu, const char *file) {
+    char p[96], b[32];
+    snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/%s", cpu, file);
+    FILE *f = fopen(p, "r");
+    if (!f) return -1;
+    long v = fgets(b, sizeof b, f) ? atol(b) : -1;
+    fclose(f);
+    return v;
+}
+
+// "0-7,16-23" (a sysfs cpu list) into a set; the number of cpus, or -1 when the file is missing / empty
+static int cpulist_read(const char *path, cpu_set_t *set) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char b[256];
+    bool ok = fgets(b, sizeof b, f) != NULL;
+    fclose(f);
+    if (!ok) return -1;
+    CPU_ZERO(set);
+    int n = 0;
+    for (char *p = b; *p && *p != '\n';) {
+        char *q;
+        long lo = strtol(p, &q, 10), hi = lo;
+        if (q == p) break;
+        if (*q == '-') hi = strtol(q + 1, &q, 10);
+        for (long c = lo; c <= hi && c < CPU_SETSIZE; c++) CPU_SET((int)c, set), n++;
+        p = *q == ',' ? q + 1 : q;
+    }
+    return n ? n : -1;
+}
+
+static void pcore_log_set(const char *how, int ncpu) {
+    char list[256] = "";
+    size_t n = 0;
+    for (int c = 0; c < CPU_SETSIZE; c++)
+        if (CPU_ISSET(c, &pcore_set) && n < sizeof list - 8) n += (size_t)snprintf(list + n, sizeof list - n, "%s%d", n ? "," : "", c);
+    fprintf(stderr, "[pcore] big.LITTLE / hybrid CPU (%s): game threads on cores %s (%d of %d)\n", how, list, pcore_n, ncpu);
+}
+
+static void pcore_init(void) {
+    const char *e = getenv("SAVAGEWIND_PCORE");
+    if (e && *e && atoi(e) == 0) { fprintf(stderr, "[pcore] off (SAVAGEWIND_PCORE=0): default scheduling\n"); return; }
+    cpu_set_t allowed;
+    if (sched_getaffinity(0, sizeof allowed, &allowed) != 0) return;
+    pcore_all = allowed;
+    int ncpu = CPU_COUNT(&allowed);
+    char how[96];
+#if defined(__aarch64__) || defined(__arm__)
+    long cap[CPU_SETSIZE], lo = -1, hi = -1;
+    for (int c = 0; c < CPU_SETSIZE; c++) {
+        cap[c] = CPU_ISSET(c, &allowed) ? cpu_sysfs_long(c, "cpu_capacity") : -1;
+        if (cap[c] <= 0) continue;
+        if (lo < 0 || cap[c] < lo) lo = cap[c];
+        if (cap[c] > hi) hi = cap[c];
+    }
+    if (lo > 0 && hi > lo) {
+        CPU_ZERO(&pcore_set);
+        for (int c = 0; c < CPU_SETSIZE; c++)
+            if (cap[c] > lo) CPU_SET(c, &pcore_set), pcore_n++;
+        snprintf(how, sizeof how, "cpu_capacity %ld..%ld", lo, hi);
+        pcore_log_set(how, ncpu);
+        return;
+    }
+    if (lo > 0) { fprintf(stderr, "[pcore] %d cores of one capacity: default scheduling\n", ncpu); return; }
+#else
+    cpu_set_t pc, ec;  // (Intel hybrid: these files exist only on a hybrid CPU)
+    if (cpulist_read("/sys/devices/cpu_core/cpus", &pc) > 0 && cpulist_read("/sys/devices/cpu_atom/cpus", &ec) > 0) {
+        CPU_AND(&pcore_set, &pc, &allowed);
+        CPU_AND(&ec, &ec, &allowed);
+        if (CPU_COUNT(&pcore_set) && CPU_COUNT(&ec)) {
+            pcore_n = CPU_COUNT(&pcore_set);
+            pcore_log_set("cpu_core / cpu_atom", ncpu);
+            return;
+        }
+        fprintf(stderr, "[pcore] hybrid CPU, but the affinity allows one kind only: default scheduling\n");
+        return;
+    }
+#endif
+    // Each core's highest frequency; only a large gap counts (a desktop's favoured cores report a few percent more)
+    long f[CPU_SETSIZE], flo = -1, fhi = -1;
+    for (int c = 0; c < CPU_SETSIZE; c++) {
+        f[c] = CPU_ISSET(c, &allowed) ? cpu_sysfs_long(c, "cpufreq/cpuinfo_max_freq") : -1;
+        if (f[c] <= 0) continue;
+        if (flo < 0 || f[c] < flo) flo = f[c];
+        if (f[c] > fhi) fhi = f[c];
+    }
+    if (flo <= 0 || flo * 5 >= fhi * 4) {
+        fprintf(stderr, "[pcore] %d cores of one class (highest frequency %ld..%ld kHz): default scheduling\n", ncpu, flo, fhi);
+        return;
+    }
+    CPU_ZERO(&pcore_set);
+    for (int c = 0; c < CPU_SETSIZE; c++)
+        if (f[c] > 0 && f[c] * 5 >= fhi * 4) CPU_SET(c, &pcore_set), pcore_n++;
+    snprintf(how, sizeof how, "highest frequency %ld..%ld kHz", flo, fhi);
+    pcore_log_set(how, ncpu);
+}
+
+static bool pcore_process_set(cpu_set_t *s) {
+    pthread_once(&pcore_once, pcore_init);
+    if (pcore_n) *s = pcore_all;
+    return pcore_n != 0;
+}
+
+// (plat_cpu_placement: one logical processor per core) the big cores and the process's within that set; a thread already
+// on the big cores (none yet at game start, but the renderer's) is on all of the set again until it next asks
+static void pcore_restrict(const cpu_set_t *one) {
+    if (!pcore_n) return;
+    CPU_AND(&pcore_all, &pcore_all, one);
+    CPU_AND(&pcore_set, &pcore_set, one);
+    pcore_n = CPU_COUNT(&pcore_set);
+}
+
+void plat_thread_default_core(void) {
+    pthread_once(&pcore_once, pcore_init);
+    if (pcore_n) pthread_setaffinity_np(pthread_self(), sizeof pcore_all, &pcore_all);
+}
+
+// The game's own threads join the big cores too (in LAS Recomp on an RK3588 the busiest guest thread wasn't the main
+// one; with them free 11-12 % of 2 s windows missed a vblank on a walking route, 2 % with them on the A76s).
+// SAVAGEWIND_PCORE_GUEST=0: only the render / vsync threads.
+void plat_thread_perf_core(int role) {
+    pthread_once(&pcore_once, pcore_init);
+    if (!pcore_n) return;
+    if (role == PLAT_PERF_GUEST) {
+        static int on = -1;
+        if (on < 0) {
+            const char *e = getenv("SAVAGEWIND_PCORE_GUEST");
+            on = !e || !*e || atoi(e) != 0;
+            fprintf(stderr, "[pcore] guest threads: %s\n", on ? "big cores" : "all cores (SAVAGEWIND_PCORE_GUEST=0)");
+        }
+        if (!on) { pthread_setaffinity_np(pthread_self(), sizeof pcore_all, &pcore_all); return; }
+    }
+    bool ok = pthread_setaffinity_np(pthread_self(), sizeof pcore_set, &pcore_set) == 0;
+    static _Atomic int logged;
+    static const char *const names[] = {"guest", "render", "vsync"};
+    if (role < 0 || role > 2 || (atomic_fetch_or(&logged, 1 << role) & (1 << role))) return;
+    if (role || !ok) fprintf(stderr, "[pcore] %s thread: %s\n", names[role], ok ? "big cores" : "affinity refused (default scheduling)");
 }
 
 // Real-time scheduling where the user may have it (rtkit / limits.conf), else just a higher priority: keeps the

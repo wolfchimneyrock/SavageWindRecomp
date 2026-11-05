@@ -8,6 +8,7 @@
 #include "hle.h"
 #include "kernel.h"
 #include "prof.h"
+#include "platform.h"
 
 // ------------------------------------------------------------------ results
 #undef R_OK
@@ -399,6 +400,7 @@ static void *thread_main(void *arg) {
         snprintf(pn, sizeof pn, "guest-%x", t->handle);
         prof_thread_name(pn);
     }
+    plat_thread_perf_core(PLAT_PERF_GUEST);  // (big.LITTLE: the big cores, platform.h)
     crash_handler_install();
     rt_set_fpcr(0);
     core_acquire(t);

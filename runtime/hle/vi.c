@@ -5,6 +5,7 @@
 #include "../hle.h"
 #include "../kernel.h"
 #include "../prof.h"
+#include "../platform.h"
 
 static uint32_t vsync_r, vsync_w;
 static KEvent *vsync_event;
@@ -15,6 +16,7 @@ static void *vsync_thread(void *arg) {
     (void)arg;
     prof_thread_name("vsync");
     const uint64_t period = 16666667;
+    plat_thread_perf_core(PLAT_PERF_VSYNC);
     plat_thread_realtime(period);
     uint64_t next = plat_now_ns();
     for (;;) {
