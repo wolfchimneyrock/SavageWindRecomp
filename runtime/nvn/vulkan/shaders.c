@@ -11,6 +11,7 @@
 
 #include "../shader_archive.h"
 #include "shaders.h"
+#include "../../platform.h"
 
 // What the translated shaders depend on besides their binaries: the translator's sources (maxwell_translator_id)
 // and the GLSL -> SPIR-V step's (vk_spirv_id). Caches built from translated shaders (cache/xlate, the pipeline cache,
@@ -189,6 +190,7 @@ const char *vk_cache_dir_id(const char *id) {
 // that updates do not pile them up (the whole game's precompiled shaders are ~0.4 GB). Runs on a thread of its own.
 static void *cleanup_thread(void *arg) {
     (void)arg;
+    plat_thread_default_core();
     const char *keep[2] = {vk_cache_dir_id(maxwell_translator_id()), vk_cache_dir_id(vk_spirv_id())};
     static const char *const sub[2] = {"xlate", "spirv"};
     int removed = 0;

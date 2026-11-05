@@ -60,6 +60,19 @@ uint64_t plat_now_ns(void);                // monotonic
 void plat_sleep_until_ns(uint64_t t);      // precise wait for plat_now_ns() >= t
 void plat_thread_realtime(uint64_t period_ns);  // periodic timing thread (vsync): don't coalesce its timers
 void plat_cpu_placement(void);  // (game start) one logical processor per core on CPUs with SMT and 8+ cores (Windows)
+// (Linux) Big and little cores (arm64 big.LITTLE: RK3588's 4x A76 + 4x A55, QCS6490's A78s; Intel hybrid): the frame's
+// critical threads on the big ones. plat_thread_perf_core: the calling thread is one (guest threads, the NVN queue and
+// recorder threads, vsync); plat_thread_default_core: the calling thread on all of the process's cores again (a
+// thread inherits its creator's affinity: shader translators and workers). SAVAGEWIND_PCORE=0: off;
+// SAVAGEWIND_PCORE_GUEST=0: guest threads on every core. Elsewhere no-ops.
+enum { PLAT_PERF_GUEST, PLAT_PERF_RENDER, PLAT_PERF_VSYNC };
+#ifdef __linux__
+void plat_thread_perf_core(int role);
+void plat_thread_default_core(void);
+#else
+static inline void plat_thread_perf_core(int role) { (void)role; }
+static inline void plat_thread_default_core(void) {}
+#endif
 
 // ---- process
 void plat_init(void);                                // first thing in main()

@@ -7,6 +7,7 @@
 #include "../kernel.h"
 #include "../perfmon.h"
 #include "nvn.h"
+#include "../platform.h"
 
 void renderer_sync(void);
 
@@ -222,6 +223,7 @@ static void qop_run(const QOp *o) {
 
 static void *queue_thread(void *arg) {
     (void)arg;
+    plat_thread_perf_core(PLAT_PERF_RENDER);
     kernel_sample_host_thread();
     pthread_mutex_lock(&g_q_lock);
     for (;;) {
