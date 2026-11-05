@@ -765,10 +765,12 @@ void vk_translator_setup(void) {
     // help Mesa's PanVK, which reads constant buffers from memory every time; not yet measured here).
     // SAVAGEWIND_VK_INLINE_C1 / SAVAGEWIND_VK_PUSH_CB =1 turn them on.
     maxwell_glsl_push = false;
+    maxwell_glsl_cb_vec4 = g_vk.is_mali;  // (SAVAGEWIND_VK_CB_VEC4: Mali wins, Turnip loses vertex instructions)
     uint32_t pcw = g_vk.props.limits.maxPushConstantsSize / 4;
     maxwell_push_cap = pcw < 64 ? pcw : 64;
-    LOG("[vk] shader constants: c1 %s, push constants %s (%u words)\n", maxwell_inline_c1() ? "inlined" : "read",
-        maxwell_push_cb() ? "on" : "off", maxwell_push_cap);
+    LOG("[vk] shader constants: c1 %s, push constants %s (%u words), register-offset reads %s\n",
+        maxwell_inline_c1() ? "inlined" : "read", maxwell_push_cb() ? "on" : "off", maxwell_push_cap,
+        maxwell_cb_vec4() ? "as uvec4" : "per word");
     LOG("[vk] shader global memory: %s (storage buffer limit %u MB), the HUD's reads %s\n",
         maxwell_gmem_bda ? "by address" : maxwell_gmem_split ? "two bindings" : "one binding", lim >> 20,
         maxwell_gmem_snap ? "through copies" : "in place");
