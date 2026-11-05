@@ -125,6 +125,10 @@ bool maxwell_inline_c1(void);
 // variant (mvec: the first MAXWELL_MVEC_PUSH bytes are its history offsets, vulkan/mvec.c, and it gets none), the
 // fragment shader's after them. size 0: none.
 bool maxwell_push_cb(void);
+// SAVAGEWIND_VK_CB_VEC4 (default maxwell_glsl_cb_vec4, the backend's: Mali): up to four constant buffer reads at one
+// register offset into the same 16 bytes as one uvec4 load where the offset is 16-byte aligned (translate.c vec_cbr)
+extern bool maxwell_glsl_cb_vec4;
+bool maxwell_cb_vec4(void);
 #define MAXWELL_MVEC_PUSH 112
 void maxwell_push_range(int stage, bool mvec, uint32_t *base, uint32_t *size);
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register

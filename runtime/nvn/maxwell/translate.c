@@ -2258,6 +2258,131 @@ static void glsl_body(Ctx *c, Str *s, const char *body, bool any_branch, bool db
     }
 }
 
+// SAVAGEWIND_VK_CB_VEC4 (default maxwell_glsl_cb_vec4: Mali): constant buffer reads at a register offset ("rD =
+// cbr(cbN, (rB) + Ku);", from LDC) are one 32-bit read per word, and Arm's compiler issues a memory load for each (a
+// skinned vertex shader's bone palette, a light loop's light records). NVIDIA reads them 16 bytes at a time. Up to
+// four reads of one base into the same 16 bytes become one uvec4 load when the base is 16-byte aligned (as these
+// tables are), the word reads otherwise. The lines between may stay in place unless they set the base or touch a
+// register whose read moves up past them, and never past braces that leave the block, a jump or a discard. (Ported
+// from LAS Recomp's fork, structured-shaders 4d911f5: on its 627 programs malioc (G610) fragment load / store cycles
+// -34 %, vertex -12 %; on Turnip it costs vertex instructions, so off there.)
+typedef struct { int first, last; } TexUnit;  // lines [first, last]
+typedef struct { char **ln; int n, cap; } Lines;
+static bool unit_touches(char **ln, TexUnit u, const char *name) {  // name as a whole token
+    size_t n = strlen(name);
+    for (int i = u.first; i <= u.last; i++)
+        for (const char *p = strstr(ln[i], name); p; p = strstr(p + 1, name)) {
+            char a = p > ln[i] ? p[-1] : ' ', z = p[n];
+            if (!id_char(a) && !id_char(z)) return true;
+        }
+    return false;
+}
+static bool unit_writes(char **ln, TexUnit u, const char *name) {  // "name =" (not ==, <=, >=, !=), op=, ++, --
+    size_t n = strlen(name);
+    for (int i = u.first; i <= u.last; i++)
+        for (const char *p = strstr(ln[i], name); p; p = strstr(p + 1, name)) {
+            char a = p > ln[i] ? p[-1] : ' ';
+            if (id_char(a)) continue;
+            const char *q = p + n;
+            if (id_char(*q)) continue;
+            while (*q == ' ') q++;
+            if (q[0] == '=' && q[1] != '=') return true;
+            if ((q[0] == '+' || q[0] == '-' || q[0] == '*' || q[0] == '/' || q[0] == '|' || q[0] == '&' || q[0] == '^') && q[1] == '=') return true;
+            if ((q[0] == '+' && q[1] == '+') || (q[0] == '-' && q[1] == '-')) return true;
+        }
+    return false;
+}
+static bool unit_has(char **ln, TexUnit u, const char *s) {
+    for (int i = u.first; i <= u.last; i++) if (strstr(ln[i], s)) return true;
+    return false;
+}
+bool maxwell_glsl_cb_vec4;
+bool maxwell_cb_vec4(void) {
+    static int v = -1;
+    if (v < 0) v = opt_env("SAVAGEWIND_VK_CB_VEC4", maxwell_glsl_cb_vec4);
+    return v;
+}
+static bool parse_cbr(const char *s, int *d, int *cb, int *base, unsigned *k) {
+    int n = -1;
+    if (sscanf(s, " r%d = cbr(cb%d, (r%d) + %uu);%n", d, cb, base, k, &n) != 4 || n < 0) return false;
+    return s[n] == 0 && (*k & 3) == 0;
+}
+static void vec_cbr(Str *body) {
+    if (!maxwell_cb_vec4() || !body->buf || !strstr(body->buf, "cbr(")) return;
+    Lines L = {malloc(1024 * sizeof(char *)), 0, 1024};
+    for (char *p = body->buf, *e; *p; p = e + 1) {
+        e = strchr(p, '\n');
+        if (!e) e = p + strlen(p) - 1;
+        if (L.n == L.cap) L.ln = realloc(L.ln, (size_t)(L.cap *= 2) * sizeof *L.ln);
+        L.ln[L.n++] = p;
+        if (e[0] == '\n') e[0] = 0;
+        if (!e[1]) break;
+    }
+    char **rep = calloc((size_t)L.n + 1, sizeof *rep);  // (the merged block, at its first read)
+    bool *drop = calloc((size_t)L.n + 1, sizeof *drop);  // (the other reads of a group)
+    for (int i = 0; i < L.n; i++) {
+        int d0, cb, base;
+        unsigned k0;
+        if (drop[i] || !parse_cbr(L.ln[i], &d0, &cb, &base, &k0) || d0 == base) continue;
+        int gl[4] = {i}, gd[4] = {d0}, ng = 1;
+        unsigned gk[4] = {k0};
+        char bn[8];
+        snprintf(bn, sizeof bn, "r%d", base);
+        for (int j = i + 1; j < L.n && j <= i + 48 && ng < 4; j++) {
+            int d, cb2, b2;
+            unsigned k;
+            if (parse_cbr(L.ln[j], &d, &cb2, &b2, &k) && cb2 == cb && b2 == base && k / 16 == k0 / 16) {
+                bool clash = false;  // (moved up to the first read: nothing between may use or set its register)
+                char dn[8];
+                snprintf(dn, sizeof dn, "r%d", d);
+                for (int x = i + 1; x < j && !clash; x++) if (!drop[x]) clash = unit_touches(L.ln, (TexUnit){x, x}, dn);
+                if (clash) break;
+                gl[ng] = j, gd[ng] = d, gk[ng] = k, ng++;
+                if (d == base) break;  // (the base's last read)
+                continue;
+            }
+            // anything else between: no braces leaving the block, and it must not set the base. (It may use the
+            // group's registers read so far: they are set before it either way. A read moved up past it: above.)
+            if (strstr(L.ln[j], "case ") || strstr(L.ln[j], "default:")) break;
+            int e = j, bal = 0;  // (a whole { ... } block counts as one step: an XMAD's temporaries, a guarded insn)
+            for (;;) {
+                for (const char *q = L.ln[e]; *q; q++) bal += *q == '{' ? 1 : *q == '}' ? -1 : 0;
+                if (bal <= 0 || e + 1 >= L.n || e > j + 32) break;
+                e++;
+            }
+            if (bal != 0) break;  // (the end of this block, or a long one)
+            TexUnit u = {j, e};
+            if (unit_writes(L.ln, u, bn) || unit_has(L.ln, u, "break;") || unit_has(L.ln, u, "continue;") ||
+                unit_has(L.ln, u, "return") || unit_has(L.ln, u, "discard") || unit_has(L.ln, u, "pc = ") ||
+                unit_has(L.ln, u, "exit_now")) break;
+            j = e;
+        }
+        if (ng < 2) continue;
+        Str t = {0};
+        const char *ind = L.ln[i];
+        int w = 0;
+        while (ind[w] == ' ') w++;
+        sp(&t, "%.*s{ uint o_ = r%d + %uu; uvec4 q_ = cb%d[min(o_ >> 4, uint(cb%d.length() - 1))];  // (%d constant reads in one)\n",
+           w, ind, base, k0 / 16 * 16, cb, cb, ng);
+        sp(&t, "%.*s  if ((o_ & 15u) == 0u) {", w, ind);
+        for (int g = 0; g < ng; g++) sp(&t, " r%d = q_[%u];", gd[g], (gk[g] >> 2) & 3);
+        sp(&t, " } else {");
+        for (int g = 0; g < ng; g++) sp(&t, " r%d = cbr(cb%d, (r%d) + %uu);", gd[g], cb, base, gk[g]);
+        sp(&t, " }\n%.*s}", w, ind);
+        rep[i] = t.buf;
+        for (int g = 1; g < ng; g++) drop[gl[g]] = true;
+    }
+    Str o = {0};
+    for (int i = 0; i < L.n; i++) {
+        if (drop[i]) continue;
+        sp(&o, "%s\n", rep[i] ? rep[i] : L.ln[i]);
+        free(rep[i]);
+    }
+    free(rep); free(drop); free(L.ln);
+    free(body->buf);
+    *body = o;
+}
+
 // SAVAGEWIND_VK_PUSH_CB (vertex and fragment): the constant buffer words read most (at constant offsets, cbufs 3+: the
 // game's own) move into push constants: fast uniform registers instead of a uniform buffer load each (Mesa's PanVK
 // keeps no uniform buffer words in fast uniforms; Arm's driver promotes them itself). A read's weight is how often it
@@ -2351,6 +2476,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (mvec_rt >= 0 && ((!mvec_mask && !mvec_still && (c->in_attr_mask >> 30)) || ((c->omap_target >> (mvec_rt * 4)) & 0xF)))
         fail(c, "mvec: input 30 / 31 or color %d in use", mvec_rt);
     if (!mvec) push_promote(c, &body, mvec_rt >= 0 && !mvec_mask && !mvec_still);  // (the motion variants' push layout)
+    vec_cbr(&body);
     if (info->uses_gmem && (info->cbuf_mask & (1u << GMEM_BUFFER_INDEX))) fail(c, "cbuf %d clashes with gmem", GMEM_BUFFER_INDEX);
     if (info->cbuf_mask >> 18) fail(c, "cbuf index out of range");
     for (int i = 0; i < info->ntex; i++)
@@ -2585,8 +2711,9 @@ const char *maxwell_translator_id(void) {
     static __thread char id[128];  // (per thread: the precompile's workers ask for it at once)
     char pc[16] = "";
     if (maxwell_push_cb()) snprintf(pc, sizeof pc, "-pc%u%s", maxwell_push_cap, opt_push_vs() ? "" : "v0");
-    snprintf(id, sizeof id, "%s%s%s%s%s%s%s", TRANSLATOR_ID, maxwell_gmem_split ? "-gs" : "", maxwell_gmem_snap ? "-gn" : "",
-             opt_static_stacks() ? "" : "-ss0", opt_goto_elim() ? "" : "-ge0", maxwell_inline_c1() ? "-c1" : "", pc);
+    snprintf(id, sizeof id, "%s%s%s%s%s%s%s%s", TRANSLATOR_ID, maxwell_gmem_split ? "-gs" : "", maxwell_gmem_snap ? "-gn" : "",
+             opt_static_stacks() ? "" : "-ss0", opt_goto_elim() ? "" : "-ge0", maxwell_inline_c1() ? "-c1" : "", pc,
+             maxwell_cb_vec4() ? "-v4" : "");
     return id;
 }
 
