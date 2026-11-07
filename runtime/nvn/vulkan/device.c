@@ -588,6 +588,15 @@ static void create_device(void) {
 #endif
     g_vk.turnip = drv.driverID == VK_DRIVER_ID_MESA_TURNIP;
     g_vk.amd_proprietary = drv.driverID == VK_DRIVER_ID_AMD_PROPRIETARY;
+    // command buffers released before each begin (record.c begin_cb_run) by default on Arm's own driver (libmali): the
+    // implicit reset of vkBeginCommandBuffer keeps the memory vkCmdBeginRendering allocates (64 KB blocks of host
+    // memory), so the process grows until it runs out of memory (~490 MB an hour in LASRecomp, libmali g29p1 on
+    // RK3588; PanVK and Turnip don't). SAVAGEWIND_VK_CB_RELEASE=0/1 overrides.
+    {
+        const char *e = getenv("SAVAGEWIND_VK_CB_RELEASE");
+        g_vk.cb_release = e ? atoi(e) != 0 : drv.driverID == VK_DRIVER_ID_ARM_PROPRIETARY;
+        if (g_vk.cb_release) LOG("[vk] command buffers release their memory at each begin%s\n", e ? " (SAVAGEWIND_VK_CB_RELEASE)" : ": Arm's driver");
+    }
     {   // (for bug reports: the driver's version, and whether ASTC textures reach the GPU as they are or decoded)
         VkFormatProperties ap;
         vkGetPhysicalDeviceFormatProperties(g_vk.phys, VK_FORMAT_ASTC_4x4_UNORM_BLOCK, &ap);
